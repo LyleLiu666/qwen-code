@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2022]
+        os: [ubuntu-24.04]
         ref: [09283f386734047dc070e72d30a484b4df6df252, 60f5c1ed95d2803a4a898a1a56b9e980b4bc38e4]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
@@ -47,20 +47,32 @@ jobs:
       - id: install
         name: Install locked dependencies and build
         run: corepack pnpm install --frozen-lockfile
-      - name: Check original fixture in default temp directory
-        continue-on-error: true
-        working-directory: packages/core
+      - name: Compare full files for timing and notification order
         run: |
-          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/code-mode/goal-evidence.test.ts
-      - name: Check fixture in runner temp directory
-        working-directory: packages/core
-        env:
-          TMP: ${{ runner.temp }}
-          TEMP: ${{ runner.temp }}
+          set +e
+          (cd packages/core && ../../node_modules/.bin/vitest run --maxWorkers=1 --retry=0 src/code-mode/code-mode.test.ts) > "$RUNNER_TEMP/core.log" 2>&1 &
+          core=$!
+          (cd packages/web-shell && ../../node_modules/.bin/vitest run --maxWorkers=1 --retry=0 client/browser-turn-notifications.test.tsx) > "$RUNNER_TEMP/web.log" 2>&1 &
+          web=$!
+          wait "$core"; cr=$?
+          wait "$web"; wr=$?
+          cat "$RUNNER_TEMP/core.log" "$RUNNER_TEMP/web.log"
+          echo "Full-file results core=$cr web=$wr"
+          exit $(( cr || wr ))
+      - name: Three bounded samples of each originally failing assertion
+        if: always() && steps.install.outcome == 'success'
         run: |
-          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/code-mode/goal-evidence.test.ts
-      - name: Verify final admission and cancellation
-        if: always() && matrix.ref == '09283f386734047dc070e72d30a484b4df6df252' && steps.install.outcome == 'success'
-        working-directory: packages/core
-        run: |
-          npx --no-install vitest run --maxWorkers=2 --minWorkers=1 src/services/session-api-history.test.ts src/services/session-transcript-reader.test.ts src/services/chatRecordingService.test.ts src/core/llm-chat.test.ts -t 'model history of completed tools|complete result of the current round|round-trips a recorded Goal|rejects a cancelled tool result|does not count a request cancelled'
+          set +e
+          result=0
+          for n in 1 2 3; do
+            (cd packages/core && ../../node_modules/.bin/vitest run --maxWorkers=1 --retry=0 src/code-mode/code-mode.test.ts -t 'does not keep exec alive for an unawaited timer') > "$RUNNER_TEMP/sample-core" 2>&1 &
+            core=$!
+            (cd packages/web-shell && ../../node_modules/.bin/vitest run --maxWorkers=1 --retry=0 client/browser-turn-notifications.test.tsx -t 'localizes action reminders in Chinese') > "$RUNNER_TEMP/sample-web" 2>&1 &
+            web=$!
+            wait "$core"; cr=$?
+            wait "$web"; wr=$?
+            cat "$RUNNER_TEMP/sample-core" "$RUNNER_TEMP/sample-web"
+            echo "Sample $n core=$cr web=$wr"
+            if (( cr || wr )); then result=1; fi
+          done
+          exit "$result"
