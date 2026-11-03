@@ -1,78 +1,82 @@
-name: Contribution verification 15595
+name: Qwen Code 15595 real local inference
 on:
   push:
     branches: [ci/15595-verification]
 permissions:
   contents: read
 jobs:
-  check:
+  live:
     if: github.repository == 'LyleLiu666/qwen-code'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04]
-        ref: [09283f386734047dc070e72d30a484b4df6df252, 60f5c1ed95d2803a4a898a1a56b9e980b4bc38e4]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    runs-on: ubuntu-24.04
+    timeout-minutes: 280
     defaults:
       run:
         shell: bash
-    env:
-      CI: 'true'
-      NODE_OPTIONS: --max-old-space-size=6144
-      QWEN_CODE_MODELS_DEV_REFRESH: 'off'
-      VITEST_MIN_FORKS: '1'
-      VITEST_MAX_FORKS: '3'
-      VITEST_MIN_THREADS: '1'
-      VITEST_MAX_THREADS: '3'
-      QWEN_CI_COVERAGE: ''
     steps:
-      - name: Configure Git line endings
-        if: runner.os == 'Windows'
-        run: git config --global core.autocrlf false
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
-          ref: ${{ matrix.ref }}
+          path: harness
+          persist-credentials: false
+          sparse-checkout: ci-harness
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          path: candidate
+          ref: 09283f386734047dc070e72d30a484b4df6df252
           persist-credentials: false
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: '22.22.3'
           package-manager-cache: false
-      - name: Check candidate and runtime
+      - name: Prepare runner disk and loopback namespace
         run: |
-          test "$(git rev-parse HEAD)" = "${{ matrix.ref }}"
-          git show -s --format='%H %s'
-          node --version
-          corepack --version
-      - id: install
-        name: Install locked dependencies and build
+          test "$(git -C candidate rev-parse HEAD)" = 09283f386734047dc070e72d30a484b4df6df252
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL
+          mkdir -p "$RUNNER_TEMP/live-home" "$RUNNER_TEMP/live-evidence"
+          sudo ip netns add qwen-live
+          sudo ip -n qwen-live link set lo up
+          sudo ip -n qwen-live address show
+          df -h .; free -h; nproc
+      - name: Install verified CPU inference runtime and model
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 2 https://github.com/ollama/ollama/releases/download/v0.40.14/ollama-linux-amd64.tar.zst -o ollama.tar.zst
+          echo '993e83d08c3d13d17c55009a3e2664c8a25445e644aec3a68bef5abb6abce67d  ollama.tar.zst' | sha256sum --check
+          mkdir ollama && tar -xf ollama.tar.zst -C ollama --exclude='*cuda*' --exclude='*rocm*'
+          rm ollama.tar.zst
+          python3 "$GITHUB_WORKSPACE/harness/ci-harness/prepare-model.py"
+          df -h .
+      - name: Build exact candidate with locked dependencies
+        working-directory: candidate
         run: corepack pnpm install --frozen-lockfile
-      - name: Compare full files for timing and notification order
+      - name: Start local Qwen model service
         run: |
-          set +e
-          (cd packages/core && ../../node_modules/.bin/vitest run --maxWorkers=1 --retry=0 src/code-mode/code-mode.test.ts) > "$RUNNER_TEMP/core.log" 2>&1 &
-          core=$!
-          (cd packages/web-shell && ../../node_modules/.bin/vitest run --maxWorkers=1 --retry=0 client/browser-turn-notifications.test.tsx) > "$RUNNER_TEMP/web.log" 2>&1 &
-          web=$!
-          wait "$core"; cr=$?
-          wait "$web"; wr=$?
-          cat "$RUNNER_TEMP/core.log" "$RUNNER_TEMP/web.log"
-          echo "Full-file results core=$cr web=$wr"
-          exit $(( cr || wr ))
-      - name: Three bounded samples of each originally failing assertion
-        if: always() && steps.install.outcome == 'success'
+          h=harness/ci-harness
+          bash "$h/run-local.sh" sh -c 'nohup "$RUNNER_TEMP/ollama/bin/ollama" serve > "$RUNNER_TEMP/live-evidence/ollama.log" 2>&1 < /dev/null &'
+          bash "$h/run-local.sh" bash -c 'for n in {1..30}; do curl -fsS http://127.0.0.1:11434/api/tags && exit 0; sleep 1; done; exit 1'
+      - id: representative
+        name: Original read_file with Qwen tool request and reply
+        working-directory: candidate
+        run: bash ../harness/ci-harness/run-local.sh python3 -u ../harness/ci-harness/run-live.py rep
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: steps.representative.outcome == 'success'
+        with:
+          name: representative-read-file
+          path: ${{ runner.temp }}/live-evidence
+          retention-days: 7
+      - name: Remaining original cases, one at a time
+        if: "!cancelled() && steps.representative.outcome == 'success'"
+        working-directory: candidate
+        run: bash ../harness/ci-harness/run-local.sh python3 -u ../harness/ci-harness/run-live.py rest
+      - name: Show evidence summary and stop local service
+        if: always()
         run: |
-          set +e
-          result=0
-          for n in 1 2 3; do
-            (cd packages/core && ../../node_modules/.bin/vitest run --maxWorkers=1 --retry=0 src/code-mode/code-mode.test.ts -t 'does not keep exec alive for an unawaited timer') > "$RUNNER_TEMP/sample-core" 2>&1 &
-            core=$!
-            (cd packages/web-shell && ../../node_modules/.bin/vitest run --maxWorkers=1 --retry=0 client/browser-turn-notifications.test.tsx -t 'localizes action reminders in Chinese') > "$RUNNER_TEMP/sample-web" 2>&1 &
-            web=$!
-            wait "$core"; cr=$?
-            wait "$web"; wr=$?
-            cat "$RUNNER_TEMP/sample-core" "$RUNNER_TEMP/sample-web"
-            echo "Sample $n core=$cr web=$wr"
-            if (( cr || wr )); then result=1; fi
-          done
-          exit "$result"
+          ls -la "$RUNNER_TEMP/live-evidence"
+          tail -20 "$RUNNER_TEMP/live-evidence/ollama.log" || true
+          sudo ip netns pids qwen-live | xargs -r sudo kill || true
+          sudo ip netns del qwen-live || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: real-qwen-43
+          path: ${{ runner.temp }}/live-evidence
+          retention-days: 7
