@@ -6261,6 +6261,9 @@ export const useLlmStream = (
         (toolCall) => toolCall.response.terminateTurn === true,
       );
       if (terminatesGoalTurn && toolGoalBinding) {
+        config
+          .getChatRecordingService()
+          ?.recordToolResultAdmission?.(responsesToSend);
         llmClient.addHistory({ role: 'user', parts: responsesToSend });
         let goalFinishFailed = false;
         try {

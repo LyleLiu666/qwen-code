@@ -959,6 +959,30 @@ const TOOL_POST_EXECUTION_CANCELLED_MESSAGE =
 const USER_PROMPT_BLOCKED_TOOL_RESULT =
   'A UserPromptSubmit hook blocked this tool result from reaching the model. Do not rerun the tool to get it.';
 
+// Tool output can include standalone images or text alongside the function
+// response. Keep only input the host added separately after the tool batch.
+function withholdToolOutput(
+  message: Content,
+  toolOutput: readonly Part[],
+  reason: string,
+): Content {
+  const parts = message.parts ?? [];
+  const calls = parts.flatMap(({ functionResponse }) =>
+    functionResponse?.id
+      ? [{ callId: functionResponse.id, name: functionResponse.name ?? '' }]
+      : [],
+  );
+  return {
+    ...message,
+    parts: [
+      ...buildSyntheticToolResponseParts(calls, reason),
+      ...parts.filter(
+        (part) => !part.functionResponse && !toolOutput.includes(part),
+      ),
+    ],
+  };
+}
+
 type ManagedConversationBinding = {
   expectation: BridgeConversationDirectoryExpectation;
   assertIdentity: () => Promise<void>;
@@ -7755,6 +7779,13 @@ export class Session implements SessionContext {
             // resolver treats that one as the turn's anchor.
             let nextMessage: Content | null = { role: 'user', parts };
             markApiHistoryPrompt(nextMessage, historyPromptId);
+            let toolOutputParts: readonly Part[] = [];
+            const closeWithheldResults = (message: Content, reason: string) => {
+              this.config
+                .getChatRecordingService()
+                ?.recordToolResultAdmission?.(toolOutputParts, reason);
+              return withholdToolOutput(message, toolOutputParts, reason);
+            };
             let turnCount = 0;
             // Puts a continue's stripped user run back while no request has
             // re-pushed it. A later send's push leaves the counter advanced,
@@ -7886,6 +7917,7 @@ export class Session implements SessionContext {
                   rejectOnLoopDetected,
                   sharedToolBatch,
                 );
+                toolOutputParts = toolRun.parts;
                 nextMessage = nextAfterTools.message;
                 if (nextAfterTools.stoppedByRepeatedToolFailure) {
                   return {
@@ -7976,7 +8008,18 @@ export class Session implements SessionContext {
                     if (isToolLapContinuation(nextMessage)) {
                       markApiHistoryPrompt(nextMessage, responseCapture.turnId);
                     }
-                    chat.addHistory(nextMessage);
+                    chat.addHistory(
+                      sharedModelRound &&
+                        turnCount > 1 &&
+                        isToolLapContinuation(nextMessage) &&
+                        !this.config.getDisableAllHooks?.() &&
+                        this.config.hasHooksForEvent?.('UserPromptSubmit')
+                        ? closeWithheldResults(
+                            nextMessage,
+                            TOOL_POST_EXECUTION_CANCELLED_MESSAGE,
+                          )
+                        : nextMessage,
+                    );
                   }
                   if (restorePostAnswerNoticesAttached) {
                     this.#clearPendingRestoreNotices();
@@ -8040,10 +8083,24 @@ export class Session implements SessionContext {
                   // re-entered turn found it: a retry's stripped attempt is put
                   // back when the prompt ends, and a continue's orphaned
                   // entries are put back here.
+                  const gatedToolResult =
+                    turnCount > 1 &&
+                    isToolLapContinuation(message) &&
+                    !this.config.getDisableAllHooks?.() &&
+                    this.config.hasHooksForEvent?.('UserPromptSubmit');
                   const keepUnsent = (unsent: Content, full: boolean) => {
                     if (restoresOriginalRetry) return;
                     if (turnCount === 1 && putBackUnsentContinue()) return;
-                    this.#preserveUnsentMessageHistory(unsent, full);
+                    this.#preserveUnsentMessageHistory(
+                      gatedToolResult
+                        ? closeWithheldResults(
+                            unsent,
+                            TOOL_POST_EXECUTION_CANCELLED_MESSAGE,
+                          )
+                        : unsent,
+                      full,
+                    );
+
                     // A restore's notices now sit in history with its answer.
                     if (
                       full &&
@@ -8394,33 +8451,16 @@ export class Session implements SessionContext {
                     // A tool-result round the hook blocked closes its calls
                     // with the block, not with the results it withheld from
                     // the model, nor with the repair's "retry if needed".
-                    const blockedCalls = (message.parts ?? []).flatMap(
-                      ({ functionResponse }) =>
-                        functionResponse?.id
-                          ? [
-                              {
-                                callId: functionResponse.id,
-                                name: functionResponse.name ?? '',
-                              },
-                            ]
-                          : [],
-                    );
-                    // Input taken with the results, already shown as
-                    // delivered, stays in history with the closed calls, as a
-                    // stopped tool run keeps it.
-                    if (!pushed && blockedCalls.length > 0) {
-                      this.#getCurrentChat().addHistory({
-                        role: 'user',
-                        parts: [
-                          ...buildSyntheticToolResponseParts(
-                            blockedCalls,
-                            USER_PROMPT_BLOCKED_TOOL_RESULT,
-                          ),
-                          ...(message.parts ?? []).filter(
-                            (part) => !part.functionResponse,
-                          ),
-                        ],
-                      });
+                    if (
+                      !pushed &&
+                      message.parts?.some((part) => part.functionResponse)
+                    ) {
+                      this.#getCurrentChat().addHistory(
+                        closeWithheldResults(
+                          message,
+                          USER_PROMPT_BLOCKED_TOOL_RESULT,
+                        ),
+                      );
                     }
                     return { stopReason: 'end_turn' };
                   }
@@ -8764,6 +8804,7 @@ export class Session implements SessionContext {
                       rejectOnLoopDetected,
                       sharedToolBatch,
                     );
+                  toolOutputParts = toolRun.parts;
                   nextMessage = nextAfterTools.message;
                   if (nextAfterTools.stoppedByRepeatedToolFailure) {
                     return {
@@ -10930,6 +10971,9 @@ export class Session implements SessionContext {
       return false;
     }
     this.todoStopGuard.suspend();
+    this.config
+      .getChatRecordingService()
+      ?.recordToolResultAdmission?.(toolRun.parts);
     this.#preserveUnsentMessageHistory(
       { role: 'user', parts: toolRun.parts },
       true,

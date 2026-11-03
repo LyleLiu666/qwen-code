@@ -303,6 +303,11 @@ export type ChatRecordProvenance =
   /** Written on behalf of a workspace agent (session multi-agent). */
   | 'external_agent';
 
+export interface ToolResultAdmissionPayload {
+  recordUuids: string[];
+  decision: 'admitted' | { withheld: string };
+}
+
 export type RecordToolResultOptions = {
   subtype?: 'code_mode_tool_result';
 } & (
@@ -423,6 +428,7 @@ export interface ChatRecord {
     | 'goal_runtime'
     | 'goal_turn_end'
     | 'code_mode_tool_result'
+    | 'tool_result_admission'
     | 'realtime_message'
     | 'turn_result'
     | 'turn_attempt'
@@ -468,6 +474,8 @@ export interface ChatRecord {
    * Pinned by the cap-refusal case in `client.test.ts`.
    */
   deliveredTurn?: boolean;
+  /** New completions require a receipt referencing their immutable record UUID. */
+  requiresToolResultAdmission?: true;
   /** Working directory at time of message */
   cwd: string;
   /** CLI version for compatibility tracking */
@@ -541,6 +549,7 @@ export interface ChatRecord {
     | BranchCheckpointRecordPayloadV1
     | GoalStateRecordPayloadV2
     | GoalTurnEndRecordPayload
+    | ToolResultAdmissionPayload
     | TurnResultRecordPayload
     | AgentMessageRecordPayload
     | AgentMentionRecordPayload;
@@ -3143,7 +3152,7 @@ export class ChatRecordingService {
   }
 
   /**
-   * Records tool results (function responses) sent back to the model.
+   * Records completed tool results for the transcript, before the next send.
    * Queues the write immediately on the serialized async writer.
    *
    * @param message The raw PartListUnion object with functionResponse parts
@@ -3162,9 +3171,52 @@ export class ChatRecordingService {
       );
       if (options?.goalContext && options.provenance !== 'goal_runtime')
         this.accumulateGoalTurnToolResult(options.goalContext.turnId);
+      // Session hooks can change between tool completion and the next send.
+      // Only the owner of live model history can admit this result.
+      if (!options?.subtype) record.requiresToolResultAdmission = true;
       this.appendRecord(record);
     } catch (error) {
       debugLogger.error('Error saving tool result:', error);
+    }
+  }
+
+  recordToolResultAdmission(
+    parts: readonly Part[],
+    withheldReason?: string,
+  ): void {
+    if (!parts.some((part) => part.functionResponse)) return;
+    const recordUuids: string[] = [];
+    // Only this model round can own the send. Matching the complete result
+    // prevents a synthetic closure with the same call ID releasing withheld bytes.
+    for (let i = this.activeBranchRecords.length - 1; i >= 0; i--) {
+      const record = this.activeBranchRecords[i];
+      if (
+        record.type === 'assistant' ||
+        (record.type === 'user' && !record.subtype)
+      )
+        break;
+      const result = record.message?.parts;
+      if (
+        record.requiresToolResultAdmission &&
+        result?.some((part) => part.functionResponse?.id) &&
+        result.every((part) =>
+          parts.some((sent) => isDeepStrictEqual(part, sent)),
+        )
+      )
+        recordUuids.unshift(record.uuid);
+    }
+    if (recordUuids.length) {
+      this.appendRecord({
+        ...this.createBaseRecord('system'),
+        subtype: 'tool_result_admission',
+        systemPayload: {
+          recordUuids,
+          decision:
+            withheldReason === undefined
+              ? 'admitted'
+              : { withheld: withheldReason },
+        },
+      });
     }
   }
 

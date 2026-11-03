@@ -2171,6 +2171,31 @@ describe('ChatRecordingService', () => {
       svc.recordToolResult(...args);
       return flushed();
     }
+    it('only admits a complete result of the current round, including its attachments', async () => {
+      const answer = fnResponse('read_file', { output: 'file body' }, 'read');
+      const attachment = { text: 'attachment body' };
+      const result = await recordTool([answer, attachment]);
+      expect(result.requiresToolResultAdmission).toBe(true);
+      svc.recordToolResultAdmission([
+        fnResponse('read_file', { error: 'blocked' }, 'read'),
+        attachment,
+      ]);
+      svc.recordToolResultAdmission([answer]);
+      await svc.flush();
+      expect(writes()).toHaveLength(1);
+      svc.recordToolResultAdmission([answer, attachment]);
+      expect(await flushed(-1)).toMatchObject({
+        subtype: 'tool_result_admission',
+        systemPayload: { decision: 'admitted', recordUuids: [result.uuid] },
+      });
+      reply('turn finished');
+      svc.recordToolResultAdmission([answer, attachment]);
+      await svc.flush();
+      expect(
+        writes().filter((r) => r.subtype === 'tool_result_admission'),
+      ).toHaveLength(1);
+    });
+
     type ToolMeta = Parameters<ChatRecordingService['recordToolResult']>[1];
     // One call-1 response plus success metadata echoing it; the metadata
     // carries undefined `error`/`errorType` keys unless `bare`.

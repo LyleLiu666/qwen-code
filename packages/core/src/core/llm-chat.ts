@@ -3510,6 +3510,9 @@ export class LlmChat {
         // gap where `lastPromptTokenCount === 0` and the gate would otherwise
         // see only the stale prior-turn count (0).
         let userContent = createUserContent(params.message);
+        this.chatRecordingService?.recordToolResultAdmission?.(
+          userContent.parts ?? [],
+        );
         // Restored responses have no original-size provenance. Never infer it from a preview.
         userContent = {
           ...userContent,
