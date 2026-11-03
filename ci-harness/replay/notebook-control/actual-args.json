@@ -1,0 +1,13 @@
+[
+  {
+    "notebook_path": "/home/runner/work/qwen-code/qwen-code/candidate/.integration-tests/1793740509120/notebook-edit-insert-and-delete-cells-8584/workflow.ipynb",
+    "cell_id": "intro",
+    "edit_mode": "insert",
+    "new_source": "## Inserted Note\nThis cell was inserted by NotebookEdit.\n"
+  },
+  {
+    "cell_id": "remove-me",
+    "edit_mode": "delete",
+    "notebook_path": "/home/runner/work/qwen-code/qwen-code/candidate/.integration-tests/1793740509120/notebook-edit-insert-and-delete-cells-8584/workflow.ipynb"
+  }
+]

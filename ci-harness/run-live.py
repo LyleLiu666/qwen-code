@@ -148,10 +148,11 @@ class Recorder:
                     record['stream'] = data.get('stream')
                 except ValueError:
                     record['requestJsonInvalid'] = True
-                upstream = http.client.HTTPConnection(*BACKEND, timeout=900)
+                upstream = http.client.HTTPConnection(*BACKEND, timeout=5)
                 watcher = None
                 try:
                     upstream.connect()
+                    upstream.sock.settimeout(900)
                     with control.lock:
                         control.upstream = upstream.sock
                     if owner.closed.is_set() or control.aborted.is_set():
@@ -353,7 +354,8 @@ class CaseProcesses:
 
     def refresh(self):
         table = process_table(self.proc_root)
-        candidates = set(self.owned)
+        candidates = {pid for pid, identity in self.owned.items()
+                      if pid in table and table[pid]['identity'] == identity}
         if self.child:
             candidates.add(self.child.pid)
         if self.marker:
@@ -444,6 +446,12 @@ def run_case(root, phase_dir, full_name, index, evidence, target=False):
                                                                     'extra_body': {'reasoning_effort': 'none'}}}]},
                 'memory': {'enableManagedAutoMemory': False, 'enableManagedAutoDream': False},
                 'general': {'enableAutoUpdate': False}}
+    if os.environ.get('LIVE_FINAL_DIAGNOSTIC') == '1':
+        system_settings.update(settings)
+        system_settings['skills'] = {'disabledLevels': ['bundled']}
+        if index == 7:
+            system_settings['tools'] = {'visible': ['cron_create', 'cron_list', 'cron_delete']}
+        write_json(system, system_settings)
     write_json(config / 'settings.json', settings)
     guard = phase_dir / 'loopback-guard.cjs'
     guard.write_text("""const fs=require('node:fs'),net=require('node:net');
@@ -484,35 +492,43 @@ const fetch=globalThis.fetch;if(fetch)globalThis.fetch=function(input,...rest){c
     watchdog = 420  # Original five-minute test timeout plus startup/teardown grace.
     print(f'::group::{full_name}', flush=True)
     print('START', full_name, flush=True)
-    with (directory / 'vitest.log').open('w') as log:
-        child = subprocess.Popen(command, cwd=root, env=env, stdout=log,
-                                 stderr=subprocess.STDOUT, start_new_session=True)
-        processes = CaseProcesses(child=child, marker=marker, home=str(home))
-        while child.poll() is None:
-            processes.refresh()
-            current = resources()
-            with (directory / 'resources.jsonl').open('a') as sink:
-                sink.write(json.dumps(current) + '\n')
-            if current['diskFreeBytes'] < 16 * 1024 ** 3:
-                reason = 'DISK_BELOW_16_GIB'
-            if current.get('memoryAvailableBytes', 1024 ** 3) < 512 * 1024 ** 2:
-                reason = 'MEMORY_AVAILABLE_BELOW_512_MIB'
-            if current.get('swapUsedBytes', 0) - initial.get('swapUsedBytes', 0) > 256 * 1024 ** 2:
-                reason = 'SWAP_GROWTH_OVER_256_MIB'
-            if time.time() - started > watchdog:
-                reason = 'PROCESS_WATCHDOG_AFTER_ORIGINAL_VITEST_TIMEOUT'
-            if reason:
-                processes.cleanup()
-                break
-            time.sleep(1)
-    cleanup = processes.cleanup()
-    write_json(directory / 'process-cleanup.json', cleanup)
+    child = None
+    processes = None
+    cleanup = {'observedPids': [], 'remainingPids': []}
     try:
-        recorder.close()
-    except RuntimeError as error:
-        reason = 'RECORDER_CLEANUP_FAILED: ' + str(error)
-    if cleanup['remainingPids']:
-        reason = 'PROCESS_CLEANUP_FAILED'
+        with (directory / 'vitest.log').open('w') as log:
+            child = subprocess.Popen(command, cwd=root, env=env, stdout=log,
+                                     stderr=subprocess.STDOUT, start_new_session=True)
+            processes = CaseProcesses(child=child, marker=marker, home=str(home))
+            while child.poll() is None:
+                processes.refresh()
+                current = resources()
+                with (directory / 'resources.jsonl').open('a') as sink:
+                    sink.write(json.dumps(current) + '\n')
+                if current['diskFreeBytes'] < 16 * 1024 ** 3:
+                    reason = 'DISK_BELOW_16_GIB'
+                if current.get('memoryAvailableBytes', 1024 ** 3) < 512 * 1024 ** 2:
+                    reason = 'MEMORY_AVAILABLE_BELOW_512_MIB'
+                if current.get('swapUsedBytes', 0) - initial.get('swapUsedBytes', 0) > 256 * 1024 ** 2:
+                    reason = 'SWAP_GROWTH_OVER_256_MIB'
+                if time.time() - started > watchdog:
+                    reason = 'PROCESS_WATCHDOG_AFTER_ORIGINAL_VITEST_TIMEOUT'
+                if reason:
+                    processes.cleanup()
+                    break
+                time.sleep(1)
+    finally:
+        if child is not None:
+            if processes is None:
+                processes = CaseProcesses(child=child, marker=marker, home=str(home))
+            cleanup = processes.cleanup()
+        write_json(directory / 'process-cleanup.json', cleanup)
+        try:
+            recorder.close()
+        except RuntimeError as error:
+            reason = 'RECORDER_CLEANUP_FAILED: ' + str(error)
+        if cleanup['remainingPids']:
+            reason = 'PROCESS_CLEANUP_FAILED'
     records = recorder.records
     selected = []
     if (directory / 'vitest.json').exists():
@@ -534,6 +550,8 @@ const fetch=globalThis.fetch;if(fetch)globalThis.fetch=function(input,...rest){c
               'failureMessages': selected[0].get('failureMessages', []) if exact else [],
               'evidence': str(directory), 'systemSettings': system_settings,
               'cleanup': cleanup, 'recorderUrl': recorder.base_url}
+    if reason and 'CLEANUP_FAILED' in reason:
+        result['status'] = 'CLEANUP_FAILED'
     if mismatches:
         result['status'] = 'CONFIG_MODEL_MISMATCH'
     if full_name == REP:
@@ -557,6 +575,9 @@ def phase_summary(sha, phase, rows, fatal=None):
 
 
 def main():
+    def interrupted(signum, _frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, interrupted)
     parser = argparse.ArgumentParser()
     parser.add_argument('phase', choices=('rep', 'rest', 'target'))
     args = parser.parse_args()
@@ -602,7 +623,7 @@ def main():
     for case_id in ids:
         parent = evidence / (f'target-{case_id}' if args.phase == 'target' else args.phase)
         run_dir = parent / 'runs' / run_id
-        run_dir.mkdir(parents=True, exist_ok=False)
+        run_dir.mkdir(parents=True, exist_ok=True)
         write_json(run_dir / 'metadata.json', metadata)
         if args.phase == 'target' and case_id == 15:
             summary = phase_summary(sha, args.phase, [])

@@ -1,0 +1,7 @@
+[
+  {
+    "file_path": "/home/runner/work/qwen-code/qwen-code/candidate/.integration-tests/1793736343180/should-handle-literally-when-replacing-text-ending-with--4708/regex.yml",
+    "old_string": "| select('match', '^[sv]d[a-z]$')",
+    "new_string": "| select('match', '^[sv]d[a-z]$' # updated)"
+  }
+]
