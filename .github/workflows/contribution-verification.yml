@@ -1,4 +1,4 @@
-name: Qwen Code 15595 ACP and one-shot verification
+name: Qwen Code 15595 two model selections
 on:
   push:
     branches: [ci/15595-verification]
@@ -8,7 +8,7 @@ jobs:
   live:
     if: github.repository == 'LyleLiu666/qwen-code'
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
@@ -22,11 +22,6 @@ jobs:
         with:
           path: candidate
           ref: 09283f386734047dc070e72d30a484b4df6df252
-          persist-credentials: false
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
-        with:
-          path: baseline
-          ref: 60f5c1ed95d2803a4a898a1a56b9e980b4bc38e4
           persist-credentials: false
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
@@ -55,44 +50,18 @@ jobs:
       - name: Build exact candidate with locked dependencies
         working-directory: candidate
         run: corepack pnpm install --frozen-lockfile
-      - name: Build baseline and replay the observed model arguments
-        run: |
-          (cd baseline && corepack pnpm install --frozen-lockfile)
-          for test in dollar-control notebook-control; do
-            mkdir -p "$RUNNER_TEMP/live-evidence/$test"
-            for tree in baseline candidate; do
-              for style in expected actual; do
-                args=()
-                if [[ $style == actual ]]; then args=("$PWD/harness/ci-harness/replay/$test/actual-args.json"); fi
-                bash harness/ci-harness/run-local.sh node "$PWD/harness/ci-harness/replay/$test/replay.mjs" "$PWD/$tree" "${args[@]}" > "$RUNNER_TEMP/live-evidence/$test/$tree-$style.json"
-              done
-            done
-          done
       - name: Start local Qwen model service
         run: |
           h=harness/ci-harness
           bash "$h/run-local.sh" sh -c 'nohup "$RUNNER_TEMP/ollama/bin/ollama" serve > "$RUNNER_TEMP/live-evidence/ollama.log" 2>&1 < /dev/null &'
           bash "$h/run-local.sh" bash -c 'for n in {1..30}; do curl -fsS http://127.0.0.1:11434/api/tags && exit 0; sleep 1; done; exit 1'
-      - name: ACP neutral prefix and exact original tests
+      - name: Two original file assertions with model reasoning enabled
         continue-on-error: true
         working-directory: candidate
         run: |
           h=../harness/ci-harness
-          bash "$h/run-local.sh" curl --max-time 1100 -fsS -H 'Content-Type: application/json' --data-binary "@$h/warm/acp-final.json" http://127.0.0.1:11434/v1/chat/completions > "$RUNNER_TEMP/live-evidence/acp-neutral.json"
-          bash "$h/run-local.sh" env LIVE_FINAL_DIAGNOSTIC=1 LIVE_CASE_IDS=1,2,3,4 python3 -u "$h/run-live.py" target
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: always()
-        with:
-          name: acp-and-tool-replay
-          path: ${{ runner.temp }}/live-evidence
-          retention-days: 7
-      - name: One-shot cron with visible native schemas and original deadline
-        continue-on-error: true
-        working-directory: candidate
-        run: |
-          h=../harness/ci-harness
-          bash "$h/run-local.sh" python3 "$h/cron-readiness.py"
-          bash "$h/run-local.sh" env LIVE_FINAL_DIAGNOSTIC=1 LIVE_CASE_IDS=7 python3 -u "$h/run-live.py" target
+          bash "$h/run-local.sh" curl --max-time 1100 -fsS -H 'Content-Type: application/json' --data-binary "@$h/warm/low-effort.json" http://127.0.0.1:11434/v1/chat/completions > "$RUNNER_TEMP/live-evidence/neutral.json"
+          bash "$h/run-local.sh" env LIVE_FINAL_DIAGNOSTIC=1 LIVE_MODEL_EFFORT=low LIVE_CASE_IDS=13,25 python3 -u "$h/run-live.py" target
       - name: Stop local service
         if: always()
         run: |
@@ -102,10 +71,10 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: final-five
+          name: two-model-choices
           path: ${{ runner.temp }}/live-evidence
           retention-days: 7
-      - name: Check five original verdicts
+      - name: Check both original verdicts
         run: |
           python3 - <<'PY'
           import json, os
@@ -113,5 +82,5 @@ jobs:
           root=Path(os.environ['RUNNER_TEMP'])/'live-evidence'
           rows=[json.loads(p.read_text()) for p in root.glob('target-*/**/result.json')]
           print([(r['case'],r['status']) for r in rows])
-          assert len(rows)==5 and all(r['status']=='PASS' and r['exactOriginalCaseMatched'] for r in rows)
+          assert len(rows)==2 and all(r['status']=='PASS' and r['exactOriginalCaseMatched'] for r in rows)
           PY
