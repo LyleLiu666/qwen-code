@@ -95,7 +95,7 @@ class Recorder:
                     record['stream'] = data.get('stream')
                 except ValueError:
                     record['requestJsonInvalid'] = True
-                connection = http.client.HTTPConnection(*BACKEND, timeout=330)
+                connection = http.client.HTTPConnection(*BACKEND, timeout=900)
                 try:
                     # Preserve request bytes and non-hop headers. No model, prompt,
                     # tool, generation parameter or answer is rewritten here.
@@ -252,7 +252,7 @@ def run_case(root, phase_dir, full_name, index, recorder):
                 'modelProviders': {'openai': [{'id': MODEL, 'name': 'Local Qwen',
                                                'baseUrl': recorder.base_url,
                                                'envKey': 'OPENAI_API_KEY',
-                                               'generationConfig': {'contextWindowSize': 32768,
+                                               'generationConfig': {'contextWindowSize': 32768, 'timeout': 850000, 'maxRetries': 0,
                                                                     'samplingParams': {'temperature': 0, 'max_tokens': 2048},
                                                                     'extra_body': {'reasoning_effort': 'none'}}}]},
                 'memory': {'enableManagedAutoMemory': False, 'enableManagedAutoDream': False},

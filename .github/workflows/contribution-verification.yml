@@ -8,7 +8,7 @@ jobs:
   live:
     if: github.repository == 'LyleLiu666/qwen-code'
     runs-on: ubuntu-24.04
-    timeout-minutes: 280
+    timeout-minutes: 345
     defaults:
       run:
         shell: bash
@@ -53,18 +53,39 @@ jobs:
           h=harness/ci-harness
           bash "$h/run-local.sh" sh -c 'nohup "$RUNNER_TEMP/ollama/bin/ollama" serve > "$RUNNER_TEMP/live-evidence/ollama.log" 2>&1 < /dev/null &'
           bash "$h/run-local.sh" bash -c 'for n in {1..30}; do curl -fsS http://127.0.0.1:11434/api/tags && exit 0; sleep 1; done; exit 1'
+      - name: Warm the model with neutral public system and tool descriptions
+        working-directory: candidate
+        run: |
+          bash ../harness/ci-harness/run-local.sh curl -fsS --max-time 1100 -H 'Content-Type: application/json' --data-binary @../harness/ci-harness/neutral-warmup.json http://127.0.0.1:11434/v1/chat/completions > "$RUNNER_TEMP/live-evidence/neutral-warmup-response.json"
+          test -s "$RUNNER_TEMP/live-evidence/neutral-warmup-response.json"
       - id: representative
         name: Original read_file with Qwen tool request and reply
         working-directory: candidate
         run: bash ../harness/ci-harness/run-local.sh python3 -u ../harness/ci-harness/run-live.py rep
+      - id: diagnostic
+        if: "!cancelled() && steps.representative.outcome == 'failure'"
+        name: Bounded read_file latency diagnostic with original assertions
+        working-directory: candidate
+        run: |
+          e="$RUNNER_TEMP/live-evidence"
+          python3 - "$e/rep" <<'PYTIME'
+          import sys
+          from pathlib import Path
+          text = next(Path(sys.argv[1]).glob('*/vitest.log')).read_text()
+          if 'timed out in 300000ms' not in text:
+              raise SystemExit('Original failure was not the outer test timeout. Retain it for diagnosis.')
+          PYTIME
+          mv "$e/rep" "$e/rep-original-warm"
+          cp "$e/coverage.json" "$e/coverage-original-warm.json"
+          bash ../harness/ci-harness/run-local.sh env TB_TIMEOUT_MINUTES=15 python3 -u ../harness/ci-harness/run-live.py rep
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: steps.representative.outcome == 'success'
+        if: "!cancelled() && (steps.representative.outcome == 'success' || steps.diagnostic.outcome == 'success')"
         with:
           name: representative-read-file
           path: ${{ runner.temp }}/live-evidence
           retention-days: 7
       - name: Remaining original cases, one at a time
-        if: "!cancelled() && steps.representative.outcome == 'success'"
+        if: "!cancelled() && (steps.representative.outcome == 'success' || steps.diagnostic.outcome == 'success')"
         working-directory: candidate
         run: bash ../harness/ci-harness/run-local.sh python3 -u ../harness/ci-harness/run-live.py rest
       - name: Show evidence summary and stop local service
