@@ -3418,6 +3418,7 @@ export class LlmChat {
       this.config.getEffectiveInputModalities();
 
     await this.sendPromise;
+    params.config?.abortSignal?.throwIfAborted();
 
     let streamDoneResolver: () => void;
     const streamDonePromise = new Promise<void>((resolve) => {
