@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """Run original Qwen CLI cases against local Ollama and retain real wire evidence."""
 import argparse
+import fcntl
 import hashlib
 import http.client
 import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
+import socket
 import signal
 import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODEL = 'qwen3.5:4b'
@@ -55,14 +59,56 @@ def local_json(path, payload=None):
         connection.close()
 
 
+class Connection:
+    def __init__(self, downstream, record):
+        self.downstream = downstream
+        self.record = record
+        self.upstream = None
+        self.finished = threading.Event()
+        self.aborted = threading.Event()
+        self.lock = threading.Lock()
+
+    def abort(self, reason, close_downstream=False):
+        with self.lock:
+            if not self.aborted.is_set():
+                self.record['cancelReason'] = reason
+                self.aborted.set()
+            sockets = [self.upstream]
+            if close_downstream:
+                sockets.append(self.downstream)
+            for connection in sockets:
+                if connection is not None:
+                    try:
+                        connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+    def watch_downstream(self):
+        while not self.finished.wait(.05):
+            try:
+                readable, _, _ = select.select([self.downstream], [], [], .05)
+                if readable and not self.downstream.recv(1, socket.MSG_PEEK):
+                    self.abort('downstream_disconnected')
+                    return
+            except (OSError, ValueError):
+                if not self.finished.is_set():
+                    self.abort('downstream_disconnected')
+                return
+
+
 class Recorder:
-    def __init__(self, directory):
+    used_ports = set()
+
+    def __init__(self, directory, case=None, port_registry=None):
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
         self.records = []
         self.lock = threading.Lock()
-        self.case = None
-        self.active = 0
+        self.case = case
+        self.connections = set()
+        self.closed = threading.Event()
+        if port_registry and port_registry.exists():
+            self.used_ports.update(json.loads(port_registry.read_text()))
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -76,34 +122,48 @@ class Recorder:
                 self.forward()
 
             def forward(self):
-                if not self.path.startswith('/v1/'):
+                if owner.closed.is_set() or not self.path.startswith('/v1/'):
                     self.close_connection = True
                     return
-                body = self.rfile.read(int(self.headers.get('Content-Length', '0')))
+                expected_length = int(self.headers.get('Content-Length', '0'))
+                body = self.rfile.read(expected_length)
+                if len(body) != expected_length:
+                    self.close_connection = True
+                    return
                 with owner.lock:
+                    if owner.closed.is_set():
+                        self.close_connection = True
+                        return
                     index = len(owner.records) + 1
                     record = {'index': index, 'case': owner.case, 'method': self.command,
                               'path': self.path, 'startTime': time.time(),
                               'requestSha256': hashlib.sha256(body).hexdigest()}
                     owner.records.append(record)
-                    owner.active += 1
-                request_path = owner.directory / f'{index:04d}-request.json'
-                request_path.write_bytes(body)
+                    control = Connection(self.connection, record)
+                    owner.connections.add(control)
+                (owner.directory / f'{index:04d}-request.json').write_bytes(body)
                 try:
                     data = json.loads(body) if body else {}
                     record['model'] = data.get('model')
                     record['stream'] = data.get('stream')
                 except ValueError:
                     record['requestJsonInvalid'] = True
-                connection = http.client.HTTPConnection(*BACKEND, timeout=900)
+                upstream = http.client.HTTPConnection(*BACKEND, timeout=900)
+                watcher = None
                 try:
-                    # Preserve request bytes and non-hop headers. No model, prompt,
-                    # tool, generation parameter or answer is rewritten here.
+                    upstream.connect()
+                    with control.lock:
+                        control.upstream = upstream.sock
+                    if owner.closed.is_set() or control.aborted.is_set():
+                        control.abort('case_closed', close_downstream=True)
+                        return
+                    watcher = threading.Thread(target=control.watch_downstream, daemon=True)
+                    watcher.start()
                     headers = {key: value for key, value in self.headers.items()
                                if key.lower() not in HOP_HEADERS}
-                    connection.request(self.command, self.path, body=body or None, headers=headers)
+                    upstream.request(self.command, self.path, body=body or None, headers=headers)
                     record['forwardedRequestSha256'] = hashlib.sha256(body).hexdigest()
-                    response = connection.getresponse()
+                    response = upstream.getresponse()
                     record['httpStatus'] = response.status
                     self.send_response(response.status, response.reason)
                     for key, value in response.getheaders():
@@ -113,7 +173,7 @@ class Recorder:
                     self.end_headers()
                     digest = hashlib.sha256()
                     with (owner.directory / f'{index:04d}-response.wire').open('wb') as sink:
-                        while True:
+                        while not control.aborted.is_set():
                             chunk = response.read1(65536)
                             if not chunk:
                                 break
@@ -123,36 +183,57 @@ class Recorder:
                             self.wfile.write(chunk)
                             self.wfile.flush()
                     record['responseSha256'] = digest.hexdigest()
-                    record['completed'] = True
+                    record['completed'] = not control.aborted.is_set()
                 except Exception as error:
                     record['transportError'] = repr(error)
+                    control.abort('transport_error')
                     self.close_connection = True
                 finally:
-                    connection.close()
+                    control.finished.set()
+                    upstream.close()
+                    if watcher:
+                        watcher.join(timeout=1)
                     record['endTime'] = time.time()
                     with owner.lock:
-                        owner.active -= 1
+                        owner.connections.discard(control)
                     owner.save()
 
-        self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        for _ in range(100):
+            self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+            port = self.server.server_port
+            if port not in self.used_ports:
+                self.used_ports.add(port)
+                break
+            self.server.server_close()
+        else:
+            raise RuntimeError('Could not allocate an unused case recorder port')
+        if port_registry:
+            write_json(port_registry, sorted(self.used_ports))
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
-        self.base_url = f'http://127.0.0.1:{self.server.server_port}/v1'
+        self.base_url = f'http://127.0.0.1:{port}/v1'
 
     def save(self):
         with self.lock:
             write_json(self.directory / 'requests.json', list(self.records))
 
-    def drain(self):
-        deadline = time.time() + 8
-        while self.active and time.time() < deadline:
-            time.sleep(.1)
-
     def close(self):
-        self.drain()
+        self.closed.set()
         self.server.shutdown()
         self.server.server_close()
+        deadline = time.monotonic() + 8
+        while True:
+            with self.lock:
+                active = list(self.connections)
+            if not active:
+                break
+            for control in active:
+                control.abort('case_cleanup', close_downstream=True)
+            if time.monotonic() >= deadline:
+                raise RuntimeError('Case recorder still has in-flight requests after cancellation')
+            time.sleep(.05)
+        self.thread.join(timeout=1)
         self.save()
 
 
@@ -223,28 +304,134 @@ def verify_representative(recorder, records):
             'reason': 'Missing actual read_file(test.txt), paired hello world result, or final hello world text'}
 
 
-def stop_process(child):
-    if child.poll() is None:
-        os.killpg(child.pid, signal.SIGTERM)
-        try:
-            child.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            os.killpg(child.pid, signal.SIGKILL)
-            child.wait(timeout=5)
+def process_table(proc_root=Path('/proc')):
+    table = {}
+    if proc_root.exists():
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                tail = (entry / 'stat').read_text().rsplit(') ', 1)[1].split()
+                table[int(entry.name)] = {'ppid': int(tail[1]), 'pgid': int(tail[2]),
+                                          'identity': tail[19], 'state': tail[0]}
+            except (OSError, ValueError, IndexError):
+                pass
+    else:
+        output = subprocess.check_output(['ps', '-axo', 'pid=,ppid=,pgid=,stat='], text=True)
+        for line in output.splitlines():
+            pid, ppid, pgid, state = line.split(None, 3)
+            table[int(pid)] = {'ppid': int(ppid), 'pgid': int(pgid),
+                               'identity': None, 'state': state}
+    return table
 
 
-def run_case(root, phase_dir, full_name, index, recorder):
-    recorder.drain()
-    recorder.case = full_name
-    begin = len(recorder.records)
+def marked_processes(key, value, proc_root=Path('/proc')):
+    found = set()
+    if not proc_root.exists():
+        return found
+    stamp = (key + '=' + value).encode()
+    for entry in proc_root.iterdir():
+        if entry.name.isdigit():
+            try:
+                if stamp in (entry / 'environ').read_bytes().split(b'\0'):
+                    found.add(int(entry.name))
+            except OSError:
+                pass
+    return found
+
+
+class CaseProcesses:
+    def __init__(self, child=None, marker=None, home=None, proc_root=Path('/proc')):
+        self.child = child
+        self.marker = marker
+        self.home = home
+        self.proc_root = proc_root
+        self.group = child.pid if child else None
+        self.owned = {}
+        self.observed = set()
+        self.refresh()
+
+    def refresh(self):
+        table = process_table(self.proc_root)
+        candidates = set(self.owned)
+        if self.child:
+            candidates.add(self.child.pid)
+        if self.marker:
+            candidates.update(marked_processes('QWEN_LIVE_CASE_TOKEN', self.marker, self.proc_root))
+        if self.home:
+            candidates.update(marked_processes('QWEN_LIVE_CASE_HOME', self.home, self.proc_root))
+        changed = True
+        while changed:
+            descendants = {pid for pid, info in table.items()
+                           if info['ppid'] in candidates or (self.group and info['pgid'] == self.group)}
+            changed = not descendants.issubset(candidates)
+            candidates.update(descendants)
+        live = {}
+        for pid in candidates:
+            info = table.get(pid)
+            if not info or pid == os.getpid() or info['state'].startswith('Z'):
+                continue
+            identity = info['identity']
+            if pid in self.owned and self.owned[pid] != identity:
+                continue
+            self.owned[pid] = identity
+            self.observed.add(pid)
+            live[pid] = identity
+        return live
+
+    def signal(self, sig):
+        live = self.refresh()
+        # The leader can already have exited while its process group remains.
+        if self.group and self.group != os.getpgrp():
+            try:
+                os.killpg(self.group, sig)
+            except ProcessLookupError:
+                pass
+        for pid, identity in live.items():
+            current = process_table(self.proc_root).get(pid)
+            if current and current['identity'] == identity:
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+
+    def cleanup(self):
+        self.signal(signal.SIGTERM)
+        deadline = time.monotonic() + 2
+        while self.refresh() and time.monotonic() < deadline:
+            time.sleep(.1)
+        if self.refresh():
+            self.signal(signal.SIGKILL)
+        if self.child:
+            try:
+                self.child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.signal(signal.SIGKILL)
+                self.child.wait(timeout=5)
+        deadline = time.monotonic() + 3
+        while self.refresh() and time.monotonic() < deadline:
+            time.sleep(.1)
+        return {'observedPids': sorted(self.observed), 'remainingPids': sorted(self.refresh())}
+
+
+def run_case(root, phase_dir, full_name, index, evidence, target=False):
     directory = phase_dir / f'{index:02d}-{hashlib.sha256(full_name.encode()).hexdigest()[:8]}'
     directory.mkdir(parents=True, exist_ok=True)
-    home = directory / 'isolated-home'
+    home = Path(os.environ['RUNNER_TEMP']) / 'q15595-case-home'
+    stale = CaseProcesses(home=str(home)).cleanup()
+    write_json(directory / 'prior-process-cleanup.json', stale)
+    if stale['remainingPids']:
+        raise RuntimeError('Previous case still has running processes')
+    if home.exists():
+        shutil.rmtree(home)
+    recorder = Recorder(directory / 'http', full_name, evidence / 'recorder-ports.json')
+    marker = uuid.uuid4().hex
     config = home / 'config'
     config.mkdir(parents=True, exist_ok=True)
     (home / 'tmp').mkdir(exist_ok=True)
     system = home / 'system.json'
-    system.write_text('{}')
+    system_settings = {'context': {'fileName': 'Q15595-E2E-CONTEXT.md'}} if target else {}
+    write_json(system, system_settings)
     settings = {'security': {'auth': {'selectedType': 'openai'},
                              'folderTrust': {'enabled': False}},
                 'model': {'name': MODEL, 'baseUrl': recorder.base_url,
@@ -272,12 +459,12 @@ const fetch=globalThis.fetch;if(fetch)globalThis.fetch=function(input,...rest){c
            'QWEN_CODE_SYSTEM_DEFAULTS_PATH': str(system),
            'QWEN_CODE_MODELS_DEV_REFRESH': 'off', 'QWEN_SANDBOX': 'false',
            'QWEN_BASELINE_SKIP_PROMPT_LATENCY': '1',
+           'TB_TIMEOUT_MINUTES': '5', 'QWEN_LIVE_CASE_TOKEN': marker,
+           'QWEN_LIVE_CASE_HOME': str(home),
            'OPENAI_API_KEY': 'synthetic-local-no-account', 'OPENAI_BASE_URL': recorder.base_url,
            'OPENAI_MODEL': MODEL, 'QWEN_MODEL': MODEL, 'NO_PROXY': 'localhost,127.0.0.1',
            'NODE_OPTIONS': '--require=' + str(guard),
            'QA_NETWORK_GUARD_LOG': str(directory / 'network-denials.jsonl')}
-    if os.environ.get('TB_TIMEOUT_MINUTES'):
-        env['TB_TIMEOUT_MINUTES'] = os.environ['TB_TIMEOUT_MINUTES']
     file, *titles = full_name.split(' > ')
     title = ' '.join(titles)
     command = [shutil.which('node'), str(root / 'node_modules/vitest/vitest.mjs'),
@@ -286,17 +473,23 @@ const fetch=globalThis.fetch;if(fetch)globalThis.fetch=function(input,...rest){c
                '--retry=0', '--reporter=default', '--reporter=json',
                '--outputFile=' + str(directory / 'vitest.json')]
     write_json(directory / 'command.json', {'command': command, 'env': env,
-                                           'originalCase': full_name, 'cwd': str(root)})
+                                           'originalCase': full_name, 'cwd': str(root),
+                                           'systemSettings': system_settings,
+                                           'environmentChanges': ['fresh stable HOME per case',
+                                                                  'independent recorder port and directory',
+                                                                  'target context filename override' if target else 'default context filename']})
     started = time.time()
     initial = resources()
     reason = None
-    watchdog = max(900, float(env.get('TB_TIMEOUT_MINUTES', '5')) * 60 + 120)
+    watchdog = 420  # Original five-minute test timeout plus startup/teardown grace.
     print(f'::group::{full_name}', flush=True)
     print('START', full_name, flush=True)
     with (directory / 'vitest.log').open('w') as log:
         child = subprocess.Popen(command, cwd=root, env=env, stdout=log,
                                  stderr=subprocess.STDOUT, start_new_session=True)
+        processes = CaseProcesses(child=child, marker=marker, home=str(home))
         while child.poll() is None:
+            processes.refresh()
             current = resources()
             with (directory / 'resources.jsonl').open('a') as sink:
                 sink.write(json.dumps(current) + '\n')
@@ -309,11 +502,18 @@ const fetch=globalThis.fetch;if(fetch)globalThis.fetch=function(input,...rest){c
             if time.time() - started > watchdog:
                 reason = 'PROCESS_WATCHDOG_AFTER_ORIGINAL_VITEST_TIMEOUT'
             if reason:
-                stop_process(child)
+                processes.cleanup()
                 break
             time.sleep(1)
-    recorder.drain()
-    records = recorder.records[begin:]
+    cleanup = processes.cleanup()
+    write_json(directory / 'process-cleanup.json', cleanup)
+    try:
+        recorder.close()
+    except RuntimeError as error:
+        reason = 'RECORDER_CLEANUP_FAILED: ' + str(error)
+    if cleanup['remainingPids']:
+        reason = 'PROCESS_CLEANUP_FAILED'
+    records = recorder.records
     selected = []
     if (directory / 'vitest.json').exists():
         report = json.loads((directory / 'vitest.json').read_text())
@@ -327,12 +527,13 @@ const fetch=globalThis.fetch;if(fetch)globalThis.fetch=function(input,...rest){c
                  ('/v1/chat/completions', '/v1/responses', '/v1/completions')]
     mismatches = [record['index'] for record in inference if record.get('model') != MODEL]
     result = {'case': full_name, 'status': 'PASS' if passed else 'FAIL' if exact else 'NOT_EXECUTED',
-              'selectedCount': len(selected), 'selectedNames': [case['fullName'] for case in selected],
+              'selectedCount': len(selected), 'exactOriginalCaseMatched': exact, 'selectedNames': [case['fullName'] for case in selected],
               'exitCode': child.returncode, 'seconds': time.time() - started,
               'inferenceRequests': len(inference), 'requestIds': [r['index'] for r in records],
               'modelMismatches': mismatches, 'resourceStop': reason,
               'failureMessages': selected[0].get('failureMessages', []) if exact else [],
-              'evidence': str(directory)}
+              'evidence': str(directory), 'systemSettings': system_settings,
+              'cleanup': cleanup, 'recorderUrl': recorder.base_url}
     if mismatches:
         result['status'] = 'CONFIG_MODEL_MISMATCH'
     if full_name == REP:
@@ -347,17 +548,27 @@ const fetch=globalThis.fetch;if(fetch)globalThis.fetch=function(input,...rest){c
     return result
 
 
+def phase_summary(sha, phase, rows, fatal=None):
+    return {'sha': sha, 'phase': phase, 'attempted': len(rows),
+            'originalAssertionsExecuted': sum(row.get('exactOriginalCaseMatched', False) for row in rows),
+            'passed': sum(row['status'] == 'PASS' for row in rows),
+            'failedOrBlocked': sum(row['status'] != 'PASS' for row in rows),
+            'cases': rows, 'fatal': fatal, 'updatedAt': time.time()}
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('phase', choices=('rep', 'rest'))
+    parser.add_argument('phase', choices=('rep', 'rest', 'target'))
     args = parser.parse_args()
     root = Path.cwd().resolve()
     expected = json.loads(Path(__file__).with_name('expected-cases.json').read_text())
     assert len(expected) == len(set(expected)) == 43 and REP in expected
+    assert expected[14] == REP
     evidence = Path(os.environ['RUNNER_TEMP']) / 'live-evidence'
     evidence.mkdir(parents=True, exist_ok=True)
-    phase_dir = evidence / args.phase
-    phase_dir.mkdir(parents=True, exist_ok=True)
+    # Stable HOME is shared across invocations only under this exclusive lock.
+    lock = (evidence / 'case-execution.lock').open('a')
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
     requested_sha = os.environ.get('EXPECTED_CANDIDATE_SHA') or os.environ.get('CANDIDATE_SHA')
     if requested_sha and sha != requested_sha:
@@ -370,44 +581,63 @@ def main():
                 'node': subprocess.check_output(['node', '--version'], text=True).strip(),
                 'version': local_json('/api/version'), 'models': local_json('/v1/models'),
                 'details': local_json('/api/show', {'model': MODEL}), 'startedAt': time.time()}
-    write_json(phase_dir / 'metadata.json', metadata)
     if MODEL not in [entry['id'] for entry in metadata['models']['data']]:
         raise RuntimeError('The expected local model is unavailable')
+    run_id = time.strftime('%Y%m%dT%H%M%S') + '-' + uuid.uuid4().hex[:8]
     rows = []
-    if args.phase == 'rest':
-        rep = json.loads((evidence / 'rep/summary.json').read_text())
-        if rep['sha'] != sha or rep['passed'] != 1 or not rep['cases'][0]['liveVerification']['passed']:
-            raise RuntimeError('The same-SHA real representative has not passed')
-        rows = list(rep['cases'])
-    cases = [REP] if args.phase == 'rep' else [case for case in expected if case != REP]
-    recorder = Recorder(phase_dir / 'http')
+    if args.phase == 'target':
+        raw = os.environ.get('LIVE_CASE_IDS', '').strip()
+        values = json.loads(raw) if raw.startswith('[') else [int(value) for value in re.split(r'[,\s]+', raw) if value]
+        if not values or any(type(value) is not int or not 1 <= value <= 43 for value in values):
+            raise ValueError('LIVE_CASE_IDS must contain original 1-based case IDs between 1 and 43')
+        ids = list(dict.fromkeys(values))
+    else:
+        ids = [15] if args.phase == 'rep' else [index for index in range(1, 44) if index != 15]
+        if args.phase == 'rest':
+            rep = json.loads((evidence / 'rep/summary.json').read_text())
+            if rep['sha'] != sha or rep['passed'] != 1 or not rep['cases'][0]['liveVerification']['passed']:
+                raise RuntimeError('The same-SHA representative has not passed')
+            rows = list(rep['cases'])
     fatal = None
-    try:
-        for index, case in enumerate(cases, 1):
-            result = run_case(root, phase_dir, case, index, recorder)
-            rows.append(result)
-            by_name = {row['case']: row for row in rows}
-            coverage = [by_name.get(name, {'case': name, 'status': 'NOT_STARTED',
-                                         'selectedCount': 0, 'inferenceRequests': 0}) for name in expected]
-            write_json(evidence / 'coverage.json', coverage)
-            summary = {'sha': sha, 'phase': args.phase, 'passed': sum(r['status'] == 'PASS' for r in rows),
-                       'attempted': len(rows), 'originalAssertionsExecuted': sum(r['selectedCount'] == 1 for r in rows),
-                       'cases': rows, 'updatedAt': time.time()}
-            write_json(phase_dir / 'summary.json', summary)
-            print('PROGRESS', args.phase, index, '/', len(cases), 'PASS', summary['passed'], flush=True)
-            if result['resourceStop']:
-                fatal = result['resourceStop']
-                break
-            # Independent failed assertions do not prevent the other original cases.
-    finally:
-        recorder.close()
-    summary = {'sha': sha, 'phase': args.phase, 'attempted': len(rows),
-               'originalAssertionsExecuted': sum(r['selectedCount'] == 1 for r in rows),
-               'passed': sum(r['status'] == 'PASS' for r in rows),
-               'failedOrBlocked': sum(r['status'] != 'PASS' for r in rows),
-               'cases': rows, 'fatal': fatal, 'finishedAt': time.time()}
-    write_json(phase_dir / 'summary.json', summary)
-    print('PHASE_COMPLETE', json.dumps({key: value for key, value in summary.items() if key != 'cases'}), flush=True)
+    for case_id in ids:
+        parent = evidence / (f'target-{case_id}' if args.phase == 'target' else args.phase)
+        run_dir = parent / 'runs' / run_id
+        run_dir.mkdir(parents=True, exist_ok=False)
+        write_json(run_dir / 'metadata.json', metadata)
+        if args.phase == 'target' and case_id == 15:
+            summary = phase_summary(sha, args.phase, [])
+            summary.update({'originalCaseId': 15, 'status': 'PREVIOUS_VERIFIED_PASS_NOT_RERUN',
+                            'case': REP, 'priorEvidence': 'first Ubuntu original read_file representative'})
+            write_json(run_dir / 'summary.json', summary)
+            write_json(parent / 'summary.json', summary)
+            print('SKIP_PREVIOUS_VERIFIED_PASS', case_id, REP, flush=True)
+            continue
+        result = run_case(root, run_dir, expected[case_id - 1], case_id, evidence,
+                          target=args.phase == 'target')
+        result['originalCaseId'] = case_id
+        if case_id == 4:
+            result['priorDiagnosticNote'] = 'Prior formal assertion passed through its allowed prompt-timeout branch; no successful exit_plan_mode response was established.'
+        rows.append(result)
+        summary_rows = [result] if args.phase == 'target' else rows
+        summary = phase_summary(sha, args.phase, summary_rows, result['resourceStop'])
+        summary['originalCaseId'] = case_id
+        summary['runId'] = run_id
+        write_json(run_dir / 'summary.json', summary)
+        write_json(parent / 'summary.json', summary)
+        coverage_path = evidence / 'coverage.json'
+        previous = json.loads(coverage_path.read_text()) if coverage_path.exists() else []
+        by_name = {entry['case']: entry for entry in previous}
+        by_name.update({entry['case']: entry for entry in rows})
+        coverage = [by_name.get(name, {'case': name, 'status': 'NOT_STARTED',
+                                     'selectedCount': 0, 'exactOriginalCaseMatched': False}) for name in expected]
+        write_json(coverage_path, coverage)
+        print('PROGRESS', args.phase, case_id, 'PASS', summary['passed'], flush=True)
+        if result['resourceStop']:
+            fatal = result['resourceStop']
+            break
+    aggregate = phase_summary(sha, args.phase, rows, fatal)
+    write_json(evidence / f'{args.phase}-{run_id}-summary.json', aggregate)
+    print('PHASE_COMPLETE', json.dumps({key: value for key, value in aggregate.items() if key != 'cases'}), flush=True)
     return 0 if not fatal and all(row['status'] == 'PASS' for row in rows) else 1
 
 
