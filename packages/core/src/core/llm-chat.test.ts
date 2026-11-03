@@ -736,24 +736,23 @@ describe('LlmChat', async () => {
       recorder: { recordToolResultAdmission, recordAssistantTurn: vi.fn() },
     });
     const reason = new Error('tool hook cancelled');
-    await expect(
-      target.sendMessageStream(
-        'test-model',
-        {
-          message: [
-            {
-              functionResponse: {
-                id: 'read',
-                name: 'read_file',
-                response: { output: 'private' },
-              },
+    const cancelled = await target.sendMessageStream(
+      'test-model',
+      {
+        message: [
+          {
+            functionResponse: {
+              id: 'read',
+              name: 'read_file',
+              response: { output: 'private' },
             },
-          ],
-          config: { abortSignal: AbortSignal.abort(reason) },
-        },
-        'first',
-      ),
-    ).rejects.toBe(reason);
+          },
+        ],
+        config: { abortSignal: AbortSignal.abort(reason) },
+      },
+      'first',
+    );
+    await expect(drain(cancelled)).rejects.toBe(reason);
     expect(recordToolResultAdmission).not.toHaveBeenCalled();
     expect(target.getHistory()).toEqual([]);
     mockStream(streamOf(stopResponse([{ text: 'done' }])));

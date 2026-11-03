@@ -3418,7 +3418,14 @@ export class LlmChat {
       this.config.getEffectiveInputModalities();
 
     await this.sendPromise;
-    params.config?.abortSignal?.throwIfAborted();
+    const signal = params.config?.abortSignal;
+    if (signal?.aborted) {
+      // Cancellation is reported when the caller consumes the stream, without
+      // reserving the lock, admitting a tool result, or changing history.
+      return (async function* cancelledSend() {
+        yield Promise.reject<never>(signal.reason);
+      })();
+    }
 
     let streamDoneResolver: () => void;
     const streamDonePromise = new Promise<void>((resolve) => {
