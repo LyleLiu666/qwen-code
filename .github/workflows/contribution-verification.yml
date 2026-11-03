@@ -1,4 +1,4 @@
-name: Current main compatibility 15595
+name: Contribution verification 15595
 on:
   push:
     branches: [ci/15595-verification]
@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04]
+        os: [ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     defaults:
@@ -26,29 +26,31 @@ jobs:
       VITEST_MAX_THREADS: '3'
       QWEN_CI_COVERAGE: ''
     steps:
+      - name: Configure Git line endings
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
-          ref: 659331efd21756104aa3053b5fe40c7b4b8f8139
+          ref: 09283f386734047dc070e72d30a484b4df6df252
           persist-credentials: false
-          fetch-depth: 0
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: '22.22.3'
           package-manager-cache: false
       - name: Check candidate and runtime
         run: |
-          test "$(git rev-parse HEAD)" = 659331efd21756104aa3053b5fe40c7b4b8f8139
+          test "$(git rev-parse HEAD)" = 09283f386734047dc070e72d30a484b4df6df252
           git show -s --format='%H %s'
           node --version
           corepack --version
-      - name: Apply candidate to verified upstream snapshot
-        run: |
-          git fetch --no-tags https://github.com/QwenLM/qwen-code.git 71119c6fa061b5ef147057679343fc5f989497df
-          git -c user.name=ci -c user.email=ci@localhost merge --no-ff --no-commit 71119c6fa061b5ef147057679343fc5f989497df
-          test "$(git write-tree)" = 68963d2f50e141b8978bbae3986f98bc1da94661
       - id: install
         name: Install locked dependencies and build
         run: corepack pnpm install --frozen-lockfile
+      - name: Verify code mode Goal evidence and final typecheck
+        working-directory: packages/core
+        run: |
+          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 src/code-mode/goal-evidence.test.ts
+          if [[ "$RUNNER_OS" == Linux ]]; then (cd ../.. && npm run typecheck); fi
       - name: Verify admission, recovery, forks and cancellation
         working-directory: packages/core
         run: |
@@ -57,4 +59,8 @@ jobs:
         if: always() && steps.install.outcome == 'success'
         working-directory: integration-tests
         run: |
-          ../node_modules/.bin/vitest run --config ./vitest.config.ts --maxWorkers=1 --minWorkers=1 --retry=0 cli/tool-hook-context.test.ts cli/acp-agent-loop-parity.test.ts -t 'resumes only tool output admitted|cancels a tool-result request whose|a Goal its second continuation completes'
+          ../node_modules/.bin/vitest run --config ./vitest.config.ts --maxWorkers=1 --minWorkers=1 --retry=0 cli/tool-hook-context.test.ts cli/acp-agent-loop-parity.test.ts -t 'resumes only tool output admitted|cancels a tool-result request whose'
+      - name: Run repository unit lanes
+        if: always() && runner.os == 'Linux' && steps.install.outcome == 'success'
+        timeout-minutes: 90
+        run: bash .github/scripts/ci/run-unit-test-lanes.sh --retry=0
