@@ -31,7 +31,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
-          ref: fe78fd54eb8d84001ed45ddab2836cf5fd8f5e46
+          ref: 6a54c92293bba5a954fe4a667859622d89f82181
           persist-credentials: false
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
@@ -40,7 +40,7 @@ jobs:
       - name: Record revision
         run: |
           mkdir -p ci-evidence
-          test "$(git rev-parse HEAD)" = fe78fd54eb8d84001ed45ddab2836cf5fd8f5e46
+          test "$(git rev-parse HEAD)" = 6a54c92293bba5a954fe4a667859622d89f82181
           git show -s --format='%H %s' | tee ci-evidence/revision.txt
           node --version | tee ci-evidence/node-version.txt
           df -h | tee ci-evidence/disk-before.txt
@@ -68,17 +68,38 @@ jobs:
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
         run: |
-          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/services/session-api-history.test.ts src/services/session-transcript-reader.test.ts src/services/chatRecordingService.test.ts src/core/llm-chat.test.ts src/code-mode/goal-evidence.test.ts -t 'model history of completed tools|complete result of the current round|round-trips a recorded Goal|preserves an ordinary prompt cancelled|withholds cancelled tool-owned|checks tool cancellation|restores prepared history when cancellation|does not count a request cancelled|Goal evidence' 2>&1 | tee ../../ci-evidence/core-focused.log
+          set +e
+          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/services/session-api-history.test.ts src/services/session-transcript-reader.test.ts src/services/chatRecordingService.test.ts src/services/tool-result-history.test.ts src/core/llm-chat.test.ts src/core/client.test.ts src/core/turn.test.ts src/code-mode/goal-evidence.test.ts -t 'model history of completed tools|complete result of the current round|round-trips a recorded Goal|preserves an ordinary prompt cancelled|withholds cancelled tool-owned|checks tool cancellation|restores prepared history when cancellation|does not count a request cancelled|strict tool admission|tool result history admission|durable admission fails|earlier withholding decision|keeps confirmed tool admission|re-syncs over the popped history|shares normalized string tool companions|carries active todos after tool results|should yield UserCancelled|Goal evidence|replaceSynthesizedToolResponse / getSynthesizedRepairCallIds|keeps late replacement consistent with real persisted admission' 2>&1 | tee ../../ci-evidence/core-focused.log
+          result=${PIPESTATUS[0]}
+          echo "core-focused=$result" >> ../../ci-evidence/exits.txt
+          exit "$result"
       - name: Verify ACP shared prompt and automatic rounds
         if: ${{ !cancelled() && runner.os == 'Windows' && steps.install.outcome == 'success' }}
         working-directory: packages/cli
         run: |
-          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/acp-integration/session/Session.test.ts -t 'shared agent loop round|delivers refined recall after tool responses|injects drained mid-turn user messages' 2>&1 | tee ../../ci-evidence/acp-focused.log
+          set +e
+          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/acp-integration/session/Session.test.ts -t 'shared agent loop round|delivers refined recall after tool responses|injects drained mid-turn user messages|terminal tool-result admission' 2>&1 | tee ../../ci-evidence/acp-focused.log
+          result=${PIPESTATUS[0]}
+          echo "acp-focused=$result" >> ../../ci-evidence/exits.txt
+          exit "$result"
+      - name: Verify terminal and late tool-result history owners
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.install.outcome == 'success' }}
+        working-directory: packages/cli
+        run: |
+          set +e
+          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/nonInteractiveCli.test.ts src/ui/hooks/use-llm-stream.test.tsx src/ui/opentui/live-session.test.ts -t 'terminal tool-result admission|late-result|late real tool result|mixed late-result|confirmed tool|durably before|ends a Goal turn without another model call' 2>&1 | tee ../../ci-evidence/terminal-owners-focused.log
+          result=${PIPESTATUS[0]}
+          echo "terminal-owners-focused=$result" >> ../../ci-evidence/exits.txt
+          exit "$result"
       - name: Verify real ACP and headless with loopback model
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         working-directory: integration-tests
         run: |
+          set +e
           ../node_modules/.bin/vitest run --config ./vitest.config.ts --maxWorkers=1 --minWorkers=1 --retry=0 cli/tool-hook-context.test.ts cli/acp-agent-loop-parity.test.ts 2>&1 | tee ../ci-evidence/integration.log
+          result=${PIPESTATUS[0]}
+          echo "integration=$result" >> ../ci-evidence/exits.txt
+          exit "$result"
       - name: Provision pinned linters
         if: ${{ !cancelled() && runner.os == 'Linux' && steps.install.outcome == 'success' }}
         run: |
