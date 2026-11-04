@@ -5,10 +5,14 @@ on:
 permissions:
   contents: read
 jobs:
-  linux-followup:
+  check:
     if: github.repository == 'LyleLiu666/qwen-code'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
     defaults:
       run:
         shell: bash
@@ -22,55 +26,89 @@ jobs:
       VITEST_MAX_THREADS: '3'
       QWEN_CI_COVERAGE: ''
     steps:
+      - name: Configure Git line endings
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
-          ref: f1b3cc73c46a06fbd32bbac15ad90e77c4c99757
+          ref: 9c55793e38f416d0cd7698fb3646f69770faa00a
           persist-credentials: false
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: '22.22.3'
           package-manager-cache: false
       - name: Record revision
-        env:
-          EXPECTED_SHA: f1b3cc73c46a06fbd32bbac15ad90e77c4c99757
         run: |
           mkdir -p ci-evidence
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test "$(git rev-parse HEAD)" = 9c55793e38f416d0cd7698fb3646f69770faa00a
           git show -s --format='%H %s' | tee ci-evidence/revision.txt
-          node --version
+          node --version | tee ci-evidence/node-version.txt
+          df -h | tee ci-evidence/disk-before.txt
       - id: install
-        name: Install identical locked dependencies and build
-        run: corepack pnpm install --frozen-lockfile 2>&1 | tee ci-evidence/install.log
-      - name: Diagnose uncompleted CLI files with bounded processes
-        working-directory: packages/cli
-        env:
-          NODE_OPTIONS: --max-old-space-size=3072
+        name: Install locked dependencies and build
         run: |
-          cat > progress-reporter.mjs <<'JS'
-          export default class {
-            onTestModuleStart(m) { console.log('MODULE START', m.moduleId); }
-            onTestModuleEnd(m) { console.log('MODULE END', m.moduleId); }
-            onTestCaseReady(t) { console.log('CASE START', t.fullName); }
-            onTestCaseResult(t) { console.log('CASE END', t.fullName, t.result().state); }
-          }
-          JS
-          (while true; do date -u; ps -eo pid,ppid,pcpu,rss,stat,wchan:24,args --sort=-pcpu | head -25; sleep 30; done) > ../../ci-evidence/process-heartbeat.log 2>&1 &
-          monitor_pid=$!
-          trap 'kill "$monitor_pid" 2>/dev/null || true' EXIT
-          result=0
-          for file in src/ui/hooks/use-llm-stream.test.tsx src/ui/AppContainer.test.tsx src/ui/components/InputPrompt.test.tsx; do
-            set +e
-            timeout --signal=TERM --kill-after=15s 8m npx --no-install vitest run "$file" --maxWorkers=1 --minWorkers=1 --retry=0 --reporter=default --reporter=./progress-reporter.mjs 2>&1 | tee "../../ci-evidence/$(basename "$file").log"
-            rc=${PIPESTATUS[0]}
-            set -e
-            echo "$file exit $rc" | tee -a ../../ci-evidence/exits.txt
-            if [ "$rc" -ne 0 ]; then result=$rc; fi
-            if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then break; fi
-          done
+          set +e
+          corepack pnpm install --frozen-lockfile 2>&1 | tee ci-evidence/install.log
+          result=${PIPESTATUS[0]}
+          echo "locked-install-and-build=$result" >> ci-evidence/exits.txt
+          exit "$result"
+      - name: Typecheck
+        if: steps.install.outcome == 'success' && runner.os == 'Linux'
+        run: |
+          set +e
+          npm run typecheck 2>&1 | tee ci-evidence/typecheck.log
+          result=${PIPESTATUS[0]}
+          echo "typecheck=$result" >> ci-evidence/exits.txt
+          exit "$result"
+      - name: Verify cancellation and recovery components
+        if: always() && runner.os == 'Windows' && steps.install.outcome == 'success'
+        working-directory: packages/core
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        run: |
+          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/services/session-api-history.test.ts src/services/session-transcript-reader.test.ts src/services/chatRecordingService.test.ts src/core/llm-chat.test.ts src/code-mode/goal-evidence.test.ts -t 'model history of completed tools|complete result of the current round|round-trips a recorded Goal|preserves an ordinary prompt cancelled|withholds cancelled tool-owned|checks tool cancellation|restores prepared history when cancellation|does not count a request cancelled|Goal evidence' 2>&1 | tee ../../ci-evidence/core-focused.log
+      - name: Verify ACP shared prompt and automatic rounds
+        if: always() && runner.os == 'Windows' && steps.install.outcome == 'success'
+        working-directory: packages/cli
+        run: |
+          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/acp-integration/session/Session.test.ts -t 'shared agent loop round|delivers refined recall after tool responses|injects drained mid-turn user messages' 2>&1 | tee ../../ci-evidence/acp-focused.log
+      - name: Verify real ACP and headless with loopback model
+        if: always() && steps.install.outcome == 'success'
+        working-directory: integration-tests
+        run: |
+          ../node_modules/.bin/vitest run --config ./vitest.config.ts --maxWorkers=1 --minWorkers=1 --retry=0 cli/tool-hook-context.test.ts cli/acp-agent-loop-parity.test.ts 2>&1 | tee ../ci-evidence/integration.log
+      - name: Provision pinned linters
+        if: always() && runner.os == 'Linux' && steps.install.outcome == 'success'
+        run: |
+          node --input-type=module -e '
+            import { execSync } from "node:child_process";
+            import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+            import { getLinters, getLinterTempDir } from "./scripts/lint.js";
+            const tempDir = getLinterTempDir();
+            mkdirSync(tempDir, { recursive: true });
+            const linters = getLinters();
+            for (const name of ["actionlint", "shellcheck"]) {
+              execSync(linters[name].installer, { stdio: "inherit" });
+              if (!existsSync(tempDir + "/" + name + "/" + name)) throw new Error(name + " missing");
+              appendFileSync(process.env.GITHUB_PATH, tempDir + "/" + name + "\n");
+            }
+          '
+      - name: Run official repository unit lanes
+        if: always() && runner.os == 'Linux' && steps.install.outcome == 'success'
+        timeout-minutes: 150
+        env:
+          SIDE_LANE_LOG: ${{ github.workspace }}/ci-evidence/side-lane.log
+        run: |
+          set +e
+          bash .github/scripts/ci/run-unit-test-lanes.sh --retry=0 2>&1 | tee ci-evidence/full-suite.log
+          result=${PIPESTATUS[0]}
+          echo "official-unit-lanes=$result" >> ci-evidence/exits.txt
           exit "$result"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: cli-stall-diagnostic
+          name: cancellation-fix-${{ matrix.os }}
           path: ci-evidence
           retention-days: 7
