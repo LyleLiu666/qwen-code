@@ -1,86 +1,98 @@
-name: Qwen Code 15595 final dollar test on Qwen 9B
+name: Contribution verification 15595
 on:
   push:
     branches: [ci/15595-verification]
 permissions:
   contents: read
 jobs:
-  live:
+  check:
     if: github.repository == 'LyleLiu666/qwen-code'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
     defaults:
       run:
         shell: bash
+    env:
+      CI: 'true'
+      NODE_OPTIONS: --max-old-space-size=6144
+      QWEN_CODE_MODELS_DEV_REFRESH: 'off'
+      VITEST_MIN_FORKS: '1'
+      VITEST_MAX_FORKS: '3'
+      VITEST_MIN_THREADS: '1'
+      VITEST_MAX_THREADS: '3'
+      QWEN_CI_COVERAGE: ''
     steps:
+      - name: Configure Git line endings
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
-          path: harness
-          persist-credentials: false
-          sparse-checkout: ci-harness
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
-        with:
-          path: candidate
-          ref: 09283f386734047dc070e72d30a484b4df6df252
+          ref: f1b3cc73c46a06fbd32bbac15ad90e77c4c99757
           persist-credentials: false
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: '22.22.3'
           package-manager-cache: false
-      - name: Prepare runner disk and loopback namespace
+      - name: Record revision
         run: |
-          test "$(git -C candidate rev-parse HEAD)" = 09283f386734047dc070e72d30a484b4df6df252
-          if [ "$(df --output=avail -B1 . | tail -1)" -lt 34359738368 ]; then
-            sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL
-          fi
-          mkdir -p "$RUNNER_TEMP/live-home" "$RUNNER_TEMP/live-evidence"
-          sudo ip netns add qwen-live
-          sudo ip -n qwen-live link set lo up
-          sudo ip -n qwen-live address show
-          df -h .; free -h; nproc
-      - name: Install verified CPU inference runtime and model
+          mkdir -p .qwen-ci-evidence
+          test "$(git rev-parse HEAD)" = f1b3cc73c46a06fbd32bbac15ad90e77c4c99757
+          git show -s --format='%H %s' | tee .qwen-ci-evidence/revision.txt
+          node --version
+      - id: install
+        name: Install locked dependencies and build
+        run: corepack pnpm install --frozen-lockfile 2>&1 | tee .qwen-ci-evidence/install.log
+      - name: Typecheck
+        if: runner.os == 'Linux'
+        run: npm run typecheck 2>&1 | tee .qwen-ci-evidence/typecheck.log
+      - name: Verify admission and recovery components
+        if: always() && steps.install.outcome == 'success'
+        working-directory: packages/core
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         run: |
-          cd "$RUNNER_TEMP"
-          curl -fsSL --retry 2 https://github.com/ollama/ollama/releases/download/v0.40.14/ollama-linux-amd64.tar.zst -o ollama.tar.zst
-          echo '993e83d08c3d13d17c55009a3e2664c8a25445e644aec3a68bef5abb6abce67d  ollama.tar.zst' | sha256sum --check
-          mkdir ollama && tar -xf ollama.tar.zst -C ollama --exclude='*cuda*' --exclude='*rocm*'
-          rm ollama.tar.zst
-          python3 "$GITHUB_WORKSPACE/harness/ci-harness/prepare-model.py"
-          df -h .
-      - name: Build exact candidate with locked dependencies
-        working-directory: candidate
-        run: corepack pnpm install --frozen-lockfile
-      - name: Start local Qwen model service
+          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/services/session-api-history.test.ts src/services/session-transcript-reader.test.ts src/services/chatRecordingService.test.ts src/core/llm-chat.test.ts src/code-mode/goal-evidence.test.ts -t 'model history of completed tools|complete result of the current round|round-trips a recorded Goal|rejects a cancelled tool result|does not count a request cancelled|Goal evidence' 2>&1 | tee ../../.qwen-ci-evidence/core-focused.log
+      - name: Verify ACP shared prompt and automatic rounds
+        if: always() && steps.install.outcome == 'success'
+        working-directory: packages/cli
         run: |
-          h=harness/ci-harness
-          bash "$h/run-local.sh" sh -c 'nohup "$RUNNER_TEMP/ollama/bin/ollama" serve > "$RUNNER_TEMP/live-evidence/ollama.log" 2>&1 < /dev/null &'
-          bash "$h/run-local.sh" bash -c 'for n in {1..30}; do curl -fsS http://127.0.0.1:11434/api/tags && exit 0; sleep 1; done; exit 1'
-      - name: Original literal dollar assertion with Qwen 9B
-        continue-on-error: true
-        working-directory: candidate
+          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/acp-integration/session/Session.test.ts -t 'shared agent loop round' 2>&1 | tee ../../.qwen-ci-evidence/acp-focused.log
+      - name: Verify real ACP and headless with loopback model
+        if: always() && steps.install.outcome == 'success'
+        working-directory: integration-tests
         run: |
-          h=../harness/ci-harness
-          bash "$h/run-local.sh" curl --max-time 1600 -fsS -H 'Content-Type: application/json' --data-binary "@$h/warm/9b.json" http://127.0.0.1:11434/v1/chat/completions > "$RUNNER_TEMP/live-evidence/neutral.json"
-          bash "$h/run-local.sh" env LIVE_FINAL_DIAGNOSTIC=1 LIVE_MODEL_EFFORT=low LIVE_CASE_IDS=13 python3 -u "$h/run-live.py" target
-      - name: Stop local service
-        if: always()
+          ../node_modules/.bin/vitest run --config ./vitest.config.ts --maxWorkers=1 --minWorkers=1 --retry=0 cli/tool-hook-context.test.ts cli/acp-agent-loop-parity.test.ts 2>&1 | tee ../.qwen-ci-evidence/integration.log
+      - name: Provision pinned linters
+        if: always() && runner.os == 'Linux' && steps.install.outcome == 'success'
         run: |
-          tail -15 "$RUNNER_TEMP/live-evidence/ollama.log" || true
-          sudo ip netns pids qwen-live | xargs -r sudo kill || true
-          sudo ip netns del qwen-live || true
+          node --input-type=module -e '
+            import { execSync } from "node:child_process";
+            import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+            import { getLinters, getLinterTempDir } from "./scripts/lint.js";
+            const tempDir = getLinterTempDir();
+            mkdirSync(tempDir, { recursive: true });
+            const linters = getLinters();
+            for (const name of ["actionlint", "shellcheck"]) {
+              execSync(linters[name].installer, { stdio: "inherit" });
+              if (!existsSync(tempDir + "/" + name + "/" + name)) throw new Error(name + " missing");
+              appendFileSync(process.env.GITHUB_PATH, tempDir + "/" + name + "\n");
+            }
+          '
+      - name: Run all repository unit lanes without early bail
+        if: always() && runner.os == 'Linux' && steps.install.outcome == 'success'
+        timeout-minutes: 130
+        env:
+          SIDE_LANE_LOG: ${{ github.workspace }}/.qwen-ci-evidence/side-lane.log
+        run: bash .github/scripts/ci/run-unit-test-lanes.sh --retry=0 --bail=0 2>&1 | tee .qwen-ci-evidence/full-suite.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: nine-billion-dollars-case
-          path: ${{ runner.temp }}/live-evidence
+          name: main-adaptation-${{ matrix.os }}
+          path: .qwen-ci-evidence
           retention-days: 7
-      - name: Check original dollar assertion
-        run: |
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          root=Path(os.environ['RUNNER_TEMP'])/'live-evidence'
-          rows=[json.loads(p.read_text()) for p in root.glob('target-*/**/result.json')]
-          print([(r['case'],r['status']) for r in rows])
-          assert len(rows)==1 and all(r['status']=='PASS' and r['exactOriginalCaseMatched'] for r in rows)
-          PY
