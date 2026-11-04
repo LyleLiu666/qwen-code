@@ -1,4 +1,4 @@
-name: Contribution verification 15595 Windows selector supplement
+name: Contribution verification 15595 Linux CLI completion and timer comparison
 on:
   push:
     branches: [ci/15595-verification]
@@ -10,7 +10,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2022]
+        include:
+          - os: ubuntu-24.04
+            scope: cli
+            label: candidate-cli-complete
+            sha: 199d52f22b14f2fb57fbf50672034fe7a09b28ec
+          - os: ubuntu-24.04
+            scope: core
+            label: candidate-code-mode
+            sha: 199d52f22b14f2fb57fbf50672034fe7a09b28ec
+          - os: ubuntu-24.04
+            scope: core
+            label: baseline-code-mode
+            sha: 9b1fcb8756a6bd2b7085c56963f60f5322d1ea3f
+    name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     defaults:
@@ -31,7 +44,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
-          ref: 6a54c92293bba5a954fe4a667859622d89f82181
+          ref: ${{ matrix.sha }}
           persist-credentials: false
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
@@ -40,7 +53,7 @@ jobs:
       - name: Record revision
         run: |
           mkdir -p ci-evidence
-          test "$(git rev-parse HEAD)" = 6a54c92293bba5a954fe4a667859622d89f82181
+          test "$(git rev-parse HEAD)" = "${{ matrix.sha }}"
           git show -s --format='%H %s' | tee ci-evidence/revision.txt
           node --version | tee ci-evidence/node-version.txt
           df -h | tee ci-evidence/disk-before.txt
@@ -52,18 +65,36 @@ jobs:
           result=${PIPESTATUS[0]}
           echo "locked-install-and-build=$result" >> ci-evidence/exits.txt
           exit "$result"
-      - name: Verify strict late repair controller cases
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+      - name: Complete all CLI tests without bail
+        if: ${{ !cancelled() && matrix.scope == 'cli' && steps.install.outcome == 'success' }}
+        timeout-minutes: 150
         working-directory: packages/cli
+        env:
+          NODE_OPTIONS: --max-old-space-size=3072
         run: |
           set +e
-          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/ui/hooks/use-llm-stream.test.tsx -t 'settles a late repair result before replacing its placeholder' 2>&1 | tee ../../ci-evidence/late-repair-selector-supplement.log
+          npx --no-install vitest run --retry=0 2>&1 | tee ../../ci-evidence/cli-complete.log
           result=${PIPESTATUS[0]}
-          echo "late-repair-selector-supplement=$result" >> ../../ci-evidence/exits.txt
+          echo "cli-complete=$result" >> ../../ci-evidence/exits.txt
           exit "$result"
+      - name: Compare unchanged code-mode file under matched conditions
+        if: ${{ !cancelled() && matrix.scope == 'core' && steps.install.outcome == 'success' }}
+        working-directory: packages/core
+        env:
+          NODE_OPTIONS: --max-old-space-size=3072
+        run: |
+          set +e
+          overall=0
+          for attempt in 1 2 3; do
+            npx --no-install vitest run --retry=0 src/code-mode/code-mode.test.ts 2>&1 | tee "../../ci-evidence/code-mode-attempt-$attempt.log"
+            result=${PIPESTATUS[0]}
+            echo "code-mode-attempt-$attempt=$result" >> ../../ci-evidence/exits.txt
+            if [ "$result" -ne 0 ]; then overall=1; fi
+          done
+          exit "$overall"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: cancellation-fix-late-repair-supplement-${{ matrix.os }}
+          name: cancellation-fix-${{ matrix.label }}
           path: ci-evidence
           retention-days: 7
