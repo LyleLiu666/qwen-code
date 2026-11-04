@@ -7,16 +7,8 @@ permissions:
 jobs:
   linux-followup:
     if: github.repository == 'LyleLiu666/qwen-code'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: candidate
-            sha: f1b3cc73c46a06fbd32bbac15ad90e77c4c99757
-          - label: baseline
-            sha: 9b1fcb8756a6bd2b7085c56963f60f5322d1ea3f
     runs-on: ubuntu-24.04
-    timeout-minutes: 100
+    timeout-minutes: 40
     defaults:
       run:
         shell: bash
@@ -32,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
-          ref: ${{ matrix.sha }}
+          ref: f1b3cc73c46a06fbd32bbac15ad90e77c4c99757
           persist-credentials: false
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
@@ -40,7 +32,7 @@ jobs:
           package-manager-cache: false
       - name: Record revision
         env:
-          EXPECTED_SHA: ${{ matrix.sha }}
+          EXPECTED_SHA: f1b3cc73c46a06fbd32bbac15ad90e77c4c99757
         run: |
           mkdir -p ci-evidence
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
@@ -49,20 +41,36 @@ jobs:
       - id: install
         name: Install identical locked dependencies and build
         run: corepack pnpm install --frozen-lockfile 2>&1 | tee ci-evidence/install.log
-      - name: Compare original memory test file
-        working-directory: packages/core
-        env:
-          NODE_OPTIONS: --max-old-space-size=3072
-        run: npx --no-install vitest run src/memory/manager.test.ts --retry=0 --maxWorkers=3 --minWorkers=1 2>&1 | tee ../../ci-evidence/memory.log
-      - name: Complete omitted candidate CLI suite
-        if: always() && steps.install.outcome == 'success' && matrix.label == 'candidate'
+      - name: Diagnose uncompleted CLI files with bounded processes
         working-directory: packages/cli
         env:
           NODE_OPTIONS: --max-old-space-size=3072
-        run: npx --no-install vitest run --retry=0 --bail=0 2>&1 | tee ../../ci-evidence/cli-full.log
+        run: |
+          cat > progress-reporter.mjs <<'JS'
+          export default class {
+            onTestModuleStart(m) { console.log('MODULE START', m.moduleId); }
+            onTestModuleEnd(m) { console.log('MODULE END', m.moduleId); }
+            onTestCaseReady(t) { console.log('CASE START', t.fullName); }
+            onTestCaseResult(t) { console.log('CASE END', t.fullName, t.result().state); }
+          }
+          JS
+          (while true; do date -u; ps -eo pid,ppid,pcpu,rss,stat,wchan:24,args --sort=-pcpu | head -25; sleep 30; done) > ../../ci-evidence/process-heartbeat.log 2>&1 &
+          monitor_pid=$!
+          trap 'kill "$monitor_pid" 2>/dev/null || true' EXIT
+          result=0
+          for file in src/ui/hooks/use-llm-stream.test.tsx src/ui/AppContainer.test.tsx src/ui/components/InputPrompt.test.tsx; do
+            set +e
+            timeout --signal=TERM --kill-after=15s 8m npx --no-install vitest run "$file" --maxWorkers=1 --minWorkers=1 --retry=0 --reporter=default --reporter=./progress-reporter.mjs 2>&1 | tee "../../ci-evidence/$(basename "$file").log"
+            rc=${PIPESTATUS[0]}
+            set -e
+            echo "$file exit $rc" | tee -a ../../ci-evidence/exits.txt
+            if [ "$rc" -ne 0 ]; then result=$rc; fi
+            if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then break; fi
+          done
+          exit "$result"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: linux-followup-${{ matrix.label }}
+          name: cli-stall-diagnostic
           path: ci-evidence
           retention-days: 7
