@@ -1,4 +1,4 @@
-name: Contribution verification 15595
+name: Contribution verification 15595 Windows selector supplement
 on:
   push:
     branches: [ci/15595-verification]
@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022]
+        os: [windows-2022]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     defaults:
@@ -52,84 +52,18 @@ jobs:
           result=${PIPESTATUS[0]}
           echo "locked-install-and-build=$result" >> ci-evidence/exits.txt
           exit "$result"
-      - name: Typecheck
-        if: steps.install.outcome == 'success' && runner.os == 'Linux'
-        run: |
-          set +e
-          npm run typecheck 2>&1 | tee ci-evidence/typecheck.log
-          result=${PIPESTATUS[0]}
-          echo "typecheck=$result" >> ci-evidence/exits.txt
-          exit "$result"
-      - name: Verify cancellation and recovery components
-        if: ${{ !cancelled() && runner.os == 'Windows' && steps.install.outcome == 'success' }}
-        working-directory: packages/core
-        env:
-          TMPDIR: ${{ runner.temp }}
-          TEMP: ${{ runner.temp }}
-          TMP: ${{ runner.temp }}
-        run: |
-          set +e
-          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/services/session-api-history.test.ts src/services/session-transcript-reader.test.ts src/services/chatRecordingService.test.ts src/services/tool-result-history.test.ts src/core/llm-chat.test.ts src/core/client.test.ts src/core/turn.test.ts src/code-mode/goal-evidence.test.ts -t 'model history of completed tools|complete result of the current round|round-trips a recorded Goal|preserves an ordinary prompt cancelled|withholds cancelled tool-owned|checks tool cancellation|restores prepared history when cancellation|does not count a request cancelled|strict tool admission|tool result history admission|durable admission fails|earlier withholding decision|keeps confirmed tool admission|re-syncs over the popped history|shares normalized string tool companions|carries active todos after tool results|should yield UserCancelled|Goal evidence|replaceSynthesizedToolResponse / getSynthesizedRepairCallIds|keeps late replacement consistent with real persisted admission' 2>&1 | tee ../../ci-evidence/core-focused.log
-          result=${PIPESTATUS[0]}
-          echo "core-focused=$result" >> ../../ci-evidence/exits.txt
-          exit "$result"
-      - name: Verify ACP shared prompt and automatic rounds
-        if: ${{ !cancelled() && runner.os == 'Windows' && steps.install.outcome == 'success' }}
-        working-directory: packages/cli
-        run: |
-          set +e
-          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/acp-integration/session/Session.test.ts -t 'shared agent loop round|delivers refined recall after tool responses|injects drained mid-turn user messages|terminal tool-result admission' 2>&1 | tee ../../ci-evidence/acp-focused.log
-          result=${PIPESTATUS[0]}
-          echo "acp-focused=$result" >> ../../ci-evidence/exits.txt
-          exit "$result"
-      - name: Verify terminal and late tool-result history owners
-        if: ${{ !cancelled() && runner.os == 'Windows' && steps.install.outcome == 'success' }}
-        working-directory: packages/cli
-        run: |
-          set +e
-          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/nonInteractiveCli.test.ts src/ui/hooks/use-llm-stream.test.tsx src/ui/opentui/live-session.test.ts -t 'terminal tool-result admission|late-result|late real tool result|mixed late-result|confirmed tool|durably before|ends a Goal turn without another model call' 2>&1 | tee ../../ci-evidence/terminal-owners-focused.log
-          result=${PIPESTATUS[0]}
-          echo "terminal-owners-focused=$result" >> ../../ci-evidence/exits.txt
-          exit "$result"
-      - name: Verify real ACP and headless with loopback model
+      - name: Verify strict late repair controller cases
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        working-directory: integration-tests
+        working-directory: packages/cli
         run: |
           set +e
-          ../node_modules/.bin/vitest run --config ./vitest.config.ts --maxWorkers=1 --minWorkers=1 --retry=0 cli/tool-hook-context.test.ts cli/acp-agent-loop-parity.test.ts 2>&1 | tee ../ci-evidence/integration.log
+          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/ui/hooks/use-llm-stream.test.tsx -t 'settles a late repair result before replacing its placeholder' 2>&1 | tee ../../ci-evidence/late-repair-selector-supplement.log
           result=${PIPESTATUS[0]}
-          echo "integration=$result" >> ../ci-evidence/exits.txt
-          exit "$result"
-      - name: Provision pinned linters
-        if: ${{ !cancelled() && runner.os == 'Linux' && steps.install.outcome == 'success' }}
-        run: |
-          node --input-type=module -e '
-            import { execSync } from "node:child_process";
-            import { appendFileSync, existsSync, mkdirSync } from "node:fs";
-            import { getLinters, getLinterTempDir } from "./scripts/lint.js";
-            const tempDir = getLinterTempDir();
-            mkdirSync(tempDir, { recursive: true });
-            const linters = getLinters();
-            for (const name of ["actionlint", "shellcheck"]) {
-              execSync(linters[name].installer, { stdio: "inherit" });
-              if (!existsSync(tempDir + "/" + name + "/" + name)) throw new Error(name + " missing");
-              appendFileSync(process.env.GITHUB_PATH, tempDir + "/" + name + "\n");
-            }
-          '
-      - name: Run official repository unit lanes
-        if: ${{ !cancelled() && runner.os == 'Linux' && steps.install.outcome == 'success' }}
-        timeout-minutes: 150
-        env:
-          SIDE_LANE_LOG: ${{ github.workspace }}/ci-evidence/side-lane.log
-        run: |
-          set +e
-          bash .github/scripts/ci/run-unit-test-lanes.sh --retry=0 2>&1 | tee ci-evidence/full-suite.log
-          result=${PIPESTATUS[0]}
-          echo "official-unit-lanes=$result" >> ci-evidence/exits.txt
+          echo "late-repair-selector-supplement=$result" >> ../../ci-evidence/exits.txt
           exit "$result"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: cancellation-fix-${{ matrix.os }}
+          name: cancellation-fix-late-repair-supplement-${{ matrix.os }}
           path: ci-evidence
           retention-days: 7
