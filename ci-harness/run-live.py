@@ -441,7 +441,7 @@ def run_case(root, phase_dir, full_name, index, evidence, target=False):
                 'modelProviders': {'openai': [{'id': MODEL, 'name': 'Local Qwen',
                                                'baseUrl': recorder.base_url,
                                                'envKey': 'OPENAI_API_KEY',
-                                               'generationConfig': {'contextWindowSize': 16384, 'timeout': 850000, 'maxRetries': 0,
+                                               'generationConfig': {'contextWindowSize': 32768, 'timeout': 850000, 'maxRetries': 0,
                                                                     'samplingParams': {'temperature': 0, 'max_tokens': 2048},
                                                                     'extra_body': {'reasoning_effort': os.environ.get('LIVE_MODEL_EFFORT', 'none')}}}]},
                 'memory': {'enableManagedAutoMemory': False, 'enableManagedAutoDream': False},
