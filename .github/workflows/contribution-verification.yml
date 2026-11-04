@@ -5,14 +5,10 @@ on:
 permissions:
   contents: read
 jobs:
-  check:
+  baseline-windows:
     if: github.repository == 'LyleLiu666/qwen-code'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-2022]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 180
+    runs-on: windows-2022
+    timeout-minutes: 40
     defaults:
       run:
         shell: bash
@@ -27,11 +23,10 @@ jobs:
       QWEN_CI_COVERAGE: ''
     steps:
       - name: Configure Git line endings
-        if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
-          ref: f1b3cc73c46a06fbd32bbac15ad90e77c4c99757
+          ref: 9b1fcb8756a6bd2b7085c56963f60f5322d1ea3f
           persist-credentials: false
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
@@ -39,60 +34,20 @@ jobs:
           package-manager-cache: false
       - name: Record revision
         run: |
-          mkdir -p .qwen-ci-evidence
-          test "$(git rev-parse HEAD)" = f1b3cc73c46a06fbd32bbac15ad90e77c4c99757
-          git show -s --format='%H %s' | tee .qwen-ci-evidence/revision.txt
+          mkdir -p ci-evidence
+          test "$(git rev-parse HEAD)" = 9b1fcb8756a6bd2b7085c56963f60f5322d1ea3f
+          git show -s --format='%H %s' | tee ci-evidence/revision.txt
           node --version
       - id: install
-        name: Install locked dependencies and build
-        run: corepack pnpm install --frozen-lockfile 2>&1 | tee .qwen-ci-evidence/install.log
-      - name: Typecheck
-        if: runner.os == 'Linux'
-        run: npm run typecheck 2>&1 | tee .qwen-ci-evidence/typecheck.log
-      - name: Verify admission and recovery components
-        if: always() && steps.install.outcome == 'success'
-        working-directory: packages/core
-        env:
-          TMPDIR: ${{ runner.temp }}
-          TEMP: ${{ runner.temp }}
-          TMP: ${{ runner.temp }}
-        run: |
-          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/services/session-api-history.test.ts src/services/session-transcript-reader.test.ts src/services/chatRecordingService.test.ts src/core/llm-chat.test.ts src/code-mode/goal-evidence.test.ts -t 'model history of completed tools|complete result of the current round|round-trips a recorded Goal|rejects a cancelled tool result|does not count a request cancelled|Goal evidence' 2>&1 | tee ../../.qwen-ci-evidence/core-focused.log
-      - name: Verify ACP shared prompt and automatic rounds
-        if: always() && steps.install.outcome == 'success'
-        working-directory: packages/cli
-        run: |
-          npx --no-install vitest run --maxWorkers=1 --minWorkers=1 --retry=0 src/acp-integration/session/Session.test.ts -t 'shared agent loop round' 2>&1 | tee ../../.qwen-ci-evidence/acp-focused.log
-      - name: Verify real ACP and headless with loopback model
-        if: always() && steps.install.outcome == 'success'
+        name: Install identical locked dependencies and build
+        run: corepack pnpm install --frozen-lockfile 2>&1 | tee ci-evidence/install.log
+      - name: Compare the two original interactive failures on unchanged main
         working-directory: integration-tests
         run: |
-          ../node_modules/.bin/vitest run --config ./vitest.config.ts --maxWorkers=1 --minWorkers=1 --retry=0 cli/tool-hook-context.test.ts cli/acp-agent-loop-parity.test.ts 2>&1 | tee ../.qwen-ci-evidence/integration.log
-      - name: Provision pinned linters
-        if: always() && runner.os == 'Linux' && steps.install.outcome == 'success'
-        run: |
-          node --input-type=module -e '
-            import { execSync } from "node:child_process";
-            import { appendFileSync, existsSync, mkdirSync } from "node:fs";
-            import { getLinters, getLinterTempDir } from "./scripts/lint.js";
-            const tempDir = getLinterTempDir();
-            mkdirSync(tempDir, { recursive: true });
-            const linters = getLinters();
-            for (const name of ["actionlint", "shellcheck"]) {
-              execSync(linters[name].installer, { stdio: "inherit" });
-              if (!existsSync(tempDir + "/" + name + "/" + name)) throw new Error(name + " missing");
-              appendFileSync(process.env.GITHUB_PATH, tempDir + "/" + name + "\n");
-            }
-          '
-      - name: Run all repository unit lanes without early bail
-        if: always() && runner.os == 'Linux' && steps.install.outcome == 'success'
-        timeout-minutes: 130
-        env:
-          SIDE_LANE_LOG: ${{ github.workspace }}/.qwen-ci-evidence/side-lane.log
-        run: bash .github/scripts/ci/run-unit-test-lanes.sh --retry=0 --bail=0 2>&1 | tee .qwen-ci-evidence/full-suite.log
+          ../node_modules/.bin/vitest run --config ./vitest.config.ts --maxWorkers=1 --minWorkers=1 --retry=0 cli/tool-hook-context.test.ts -t 'interactive:' 2>&1 | tee ../ci-evidence/interactive-baseline.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: main-adaptation-${{ matrix.os }}
-          path: .qwen-ci-evidence
+          name: main-baseline-windows-interactive
+          path: ci-evidence
           retention-days: 7
