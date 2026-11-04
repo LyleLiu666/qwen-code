@@ -5,10 +5,18 @@ on:
 permissions:
   contents: read
 jobs:
-  baseline-windows:
+  linux-followup:
     if: github.repository == 'LyleLiu666/qwen-code'
-    runs-on: windows-2022
-    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: candidate
+            sha: f1b3cc73c46a06fbd32bbac15ad90e77c4c99757
+          - label: baseline
+            sha: 9b1fcb8756a6bd2b7085c56963f60f5322d1ea3f
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
     defaults:
       run:
         shell: bash
@@ -22,32 +30,39 @@ jobs:
       VITEST_MAX_THREADS: '3'
       QWEN_CI_COVERAGE: ''
     steps:
-      - name: Configure Git line endings
-        run: git config --global core.autocrlf false
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
-          ref: 9b1fcb8756a6bd2b7085c56963f60f5322d1ea3f
+          ref: ${{ matrix.sha }}
           persist-credentials: false
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: '22.22.3'
           package-manager-cache: false
       - name: Record revision
+        env:
+          EXPECTED_SHA: ${{ matrix.sha }}
         run: |
           mkdir -p ci-evidence
-          test "$(git rev-parse HEAD)" = 9b1fcb8756a6bd2b7085c56963f60f5322d1ea3f
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
           git show -s --format='%H %s' | tee ci-evidence/revision.txt
           node --version
       - id: install
         name: Install identical locked dependencies and build
         run: corepack pnpm install --frozen-lockfile 2>&1 | tee ci-evidence/install.log
-      - name: Compare the two original interactive failures on unchanged main
-        working-directory: integration-tests
-        run: |
-          ../node_modules/.bin/vitest run --config ./vitest.config.ts --maxWorkers=1 --minWorkers=1 --retry=0 cli/tool-hook-context.test.ts -t 'interactive:' 2>&1 | tee ../ci-evidence/interactive-baseline.log
+      - name: Compare original memory test file
+        working-directory: packages/core
+        env:
+          NODE_OPTIONS: --max-old-space-size=3072
+        run: npx --no-install vitest run src/memory/manager.test.ts --retry=0 --maxWorkers=3 --minWorkers=1 2>&1 | tee ../../ci-evidence/memory.log
+      - name: Complete omitted candidate CLI suite
+        if: always() && steps.install.outcome == 'success' && matrix.label == 'candidate'
+        working-directory: packages/cli
+        env:
+          NODE_OPTIONS: --max-old-space-size=3072
+        run: npx --no-install vitest run --retry=0 --bail=0 2>&1 | tee ../../ci-evidence/cli-full.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: main-baseline-windows-interactive
+          name: linux-followup-${{ matrix.label }}
           path: ci-evidence
           retention-days: 7
