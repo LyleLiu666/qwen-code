@@ -19,7 +19,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-MODEL = 'qwen3.5:4b'
+MODEL = 'qwen3.5:9b'
 BACKEND = ('127.0.0.1', 11434)
 REP = 'cli/file-system.test.ts > file-system > should be able to read a file'
 HOP_HEADERS = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
@@ -441,7 +441,7 @@ def run_case(root, phase_dir, full_name, index, evidence, target=False):
                 'modelProviders': {'openai': [{'id': MODEL, 'name': 'Local Qwen',
                                                'baseUrl': recorder.base_url,
                                                'envKey': 'OPENAI_API_KEY',
-                                               'generationConfig': {'contextWindowSize': 32768, 'timeout': 850000, 'maxRetries': 0,
+                                               'generationConfig': {'contextWindowSize': 16384, 'timeout': 850000, 'maxRetries': 0,
                                                                     'samplingParams': {'temperature': 0, 'max_tokens': 2048},
                                                                     'extra_body': {'reasoning_effort': os.environ.get('LIVE_MODEL_EFFORT', 'none')}}}]},
                 'memory': {'enableManagedAutoMemory': False, 'enableManagedAutoDream': False},

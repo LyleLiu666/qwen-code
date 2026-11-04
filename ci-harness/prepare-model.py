@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-source = Path(__file__).with_name("official-manifest.json")
+source = Path(__file__).with_name("official-manifest-9b.json")
 manifest = json.loads(source.read_bytes())
 models = Path(os.environ["RUNNER_TEMP"]) / "models"
 blobs = models / "blobs"
@@ -21,6 +21,6 @@ for layer in [manifest["config"], *manifest["layers"]]:
         assert hashlib.file_digest(stream, "sha256").hexdigest() == digest.split(":")[1]
     assert target.stat().st_size == layer["size"]
     print("Verified", layer["mediaType"], digest, target.stat().st_size, flush=True)
-tag = models / "manifests/registry.ollama.ai/library/qwen3.5/4b"
+tag = models / "manifests/registry.ollama.ai/library/qwen3.5/9b"
 tag.parent.mkdir(parents=True)
 shutil.copyfile(source, tag)

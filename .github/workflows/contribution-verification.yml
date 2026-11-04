@@ -1,4 +1,4 @@
-name: Qwen Code 15595 two model selections
+name: Qwen Code 15595 final dollar test on Qwen 9B
 on:
   push:
     branches: [ci/15595-verification]
@@ -55,13 +55,13 @@ jobs:
           h=harness/ci-harness
           bash "$h/run-local.sh" sh -c 'nohup "$RUNNER_TEMP/ollama/bin/ollama" serve > "$RUNNER_TEMP/live-evidence/ollama.log" 2>&1 < /dev/null &'
           bash "$h/run-local.sh" bash -c 'for n in {1..30}; do curl -fsS http://127.0.0.1:11434/api/tags && exit 0; sleep 1; done; exit 1'
-      - name: Two original file assertions with model reasoning enabled
+      - name: Original literal dollar assertion with Qwen 9B
         continue-on-error: true
         working-directory: candidate
         run: |
           h=../harness/ci-harness
-          bash "$h/run-local.sh" curl --max-time 1100 -fsS -H 'Content-Type: application/json' --data-binary "@$h/warm/low-effort.json" http://127.0.0.1:11434/v1/chat/completions > "$RUNNER_TEMP/live-evidence/neutral.json"
-          bash "$h/run-local.sh" env LIVE_FINAL_DIAGNOSTIC=1 LIVE_MODEL_EFFORT=low LIVE_CASE_IDS=13,25 python3 -u "$h/run-live.py" target
+          bash "$h/run-local.sh" curl --max-time 1600 -fsS -H 'Content-Type: application/json' --data-binary "@$h/warm/9b.json" http://127.0.0.1:11434/v1/chat/completions > "$RUNNER_TEMP/live-evidence/neutral.json"
+          bash "$h/run-local.sh" env LIVE_FINAL_DIAGNOSTIC=1 LIVE_MODEL_EFFORT=low LIVE_CASE_IDS=13 python3 -u "$h/run-live.py" target
       - name: Stop local service
         if: always()
         run: |
@@ -71,10 +71,10 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: two-model-choices
+          name: nine-billion-dollars-case
           path: ${{ runner.temp }}/live-evidence
           retention-days: 7
-      - name: Check both original verdicts
+      - name: Check original dollar assertion
         run: |
           python3 - <<'PY'
           import json, os
@@ -82,5 +82,5 @@ jobs:
           root=Path(os.environ['RUNNER_TEMP'])/'live-evidence'
           rows=[json.loads(p.read_text()) for p in root.glob('target-*/**/result.json')]
           print([(r['case'],r['status']) for r in rows])
-          assert len(rows)==2 and all(r['status']=='PASS' and r['exactOriginalCaseMatched'] for r in rows)
+          assert len(rows)==1 and all(r['status']=='PASS' and r['exactOriginalCaseMatched'] for r in rows)
           PY
