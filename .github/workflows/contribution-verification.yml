@@ -1,100 +1,36 @@
-name: Contribution verification 15595 Linux CLI completion and timer comparison
+name: Contribution verification 15595 Git history transport
 on:
   push:
     branches: [ci/15595-verification]
 permissions:
   contents: read
 jobs:
-  check:
+  bundle:
     if: github.repository == 'LyleLiu666/qwen-code'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            scope: cli
-            label: candidate-cli-complete
-            sha: 199d52f22b14f2fb57fbf50672034fe7a09b28ec
-          - os: ubuntu-24.04
-            scope: core
-            label: candidate-code-mode
-            sha: 199d52f22b14f2fb57fbf50672034fe7a09b28ec
-          - os: ubuntu-24.04
-            scope: core
-            label: baseline-code-mode
-            sha: 9b1fcb8756a6bd2b7085c56963f60f5322d1ea3f
-    name: ${{ matrix.label }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 180
-    defaults:
-      run:
-        shell: bash
-    env:
-      CI: 'true'
-      NODE_OPTIONS: --max-old-space-size=6144
-      QWEN_CODE_MODELS_DEV_REFRESH: 'off'
-      VITEST_MIN_FORKS: '1'
-      VITEST_MAX_FORKS: '3'
-      VITEST_MIN_THREADS: '1'
-      VITEST_MAX_THREADS: '3'
-      QWEN_CI_COVERAGE: ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - name: Configure Git line endings
-        if: runner.os == 'Windows'
-        run: git config --global core.autocrlf false
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
-          ref: ${{ matrix.sha }}
+          repository: QwenLM/qwen-code
+          ref: 07a4fda66622fc5337f4182d956736af146dad87
+          fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
-        with:
-          node-version: '22.22.3'
-          package-manager-cache: false
-      - name: Record revision
+      - name: Export verified upstream history
         run: |
-          mkdir -p ci-evidence
-          test "$(git rev-parse HEAD)" = "${{ matrix.sha }}"
-          git show -s --format='%H %s' | tee ci-evidence/revision.txt
-          node --version | tee ci-evidence/node-version.txt
-          df -h | tee ci-evidence/disk-before.txt
-      - id: install
-        name: Install locked dependencies and build
-        run: |
-          set +e
-          corepack pnpm install --frozen-lockfile 2>&1 | tee ci-evidence/install.log
-          result=${PIPESTATUS[0]}
-          echo "locked-install-and-build=$result" >> ci-evidence/exits.txt
-          exit "$result"
-      - name: Complete all CLI tests without bail
-        if: ${{ !cancelled() && matrix.scope == 'cli' && steps.install.outcome == 'success' }}
-        timeout-minutes: 150
-        working-directory: packages/cli
-        env:
-          NODE_OPTIONS: --max-old-space-size=3072
-        run: |
-          set +e
-          npx --no-install vitest run --retry=0 2>&1 | tee ../../ci-evidence/cli-complete.log
-          result=${PIPESTATUS[0]}
-          echo "cli-complete=$result" >> ../../ci-evidence/exits.txt
-          exit "$result"
-      - name: Compare unchanged code-mode file under matched conditions
-        if: ${{ !cancelled() && matrix.scope == 'core' && steps.install.outcome == 'success' }}
-        working-directory: packages/core
-        env:
-          NODE_OPTIONS: --max-old-space-size=3072
-        run: |
-          set +e
-          overall=0
-          for attempt in 1 2 3; do
-            npx --no-install vitest run --retry=0 src/code-mode/code-mode.test.ts 2>&1 | tee "../../ci-evidence/code-mode-attempt-$attempt.log"
-            result=${PIPESTATUS[0]}
-            echo "code-mode-attempt-$attempt=$result" >> ../../ci-evidence/exits.txt
-            if [ "$result" -ne 0 ]; then overall=1; fi
-          done
-          exit "$overall"
+          set -euo pipefail
+          target=07a4fda66622fc5337f4182d956736af146dad87
+          base=9b1fcb8756a6bd2b7085c56963f60f5322d1ea3f
+          test "$(git rev-parse HEAD)" = "$target"
+          git merge-base --is-ancestor "$base" "$target"
+          git update-ref refs/heads/export-main "$target"
+          mkdir evidence
+          git bundle create evidence/main-07a4fda.bundle refs/heads/export-main "^$base"
+          git bundle verify evidence/main-07a4fda.bundle 2>&1 | tee evidence/verify.txt
+          git log --format='%H %P %s' "$base..$target" > evidence/commits.txt
+          sha256sum evidence/main-07a4fda.bundle > evidence/SHA256SUMS
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: always()
         with:
-          name: cancellation-fix-${{ matrix.label }}
-          path: ci-evidence
+          name: upstream-main-07a4fda-git-bundle
+          path: evidence
           retention-days: 7
