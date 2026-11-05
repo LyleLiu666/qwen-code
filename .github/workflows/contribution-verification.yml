@@ -1,4 +1,4 @@
-name: 15595 R2 failures exact sources on one runner
+name: 15595 final MemoryManager exact source controls
 'on':
   push:
     branches:
@@ -6,7 +6,7 @@ name: 15595 R2 failures exact sources on one runner
 permissions:
   contents: read
 concurrency:
-  group: q15595-r2-controls-${{ github.run_id }}
+  group: q15595-memory-controls-${{ github.run_id }}
   cancel-in-progress: false
 jobs:
   matched_failures:
@@ -77,14 +77,14 @@ jobs:
         echo "install-matched-prerequisites=$result" >> ci-evidence/exits.txt
         exit "$result"
       timeout-minutes: 10
-    - name: Three exact revisions and three complete failure files
+    - name: Two exact revisions and complete MemoryManager file
       run: |
         set -euo pipefail
         root="$PWD"
         evidence="$root/ci-evidence"
         overall=0
         printf '%s\n' "${ImageOS:-}" "${ImageVersion:-}" > "$evidence/runner-image.txt"
-        for entry in 'baseline:5d5591ed91b810faf74b5bca543f52a7b950456c' 'historical:b6403235240f1fd1a7ae9b5324c836686fbc0a21' 'final:54919c760bb6d2fb1492378abfd1764c88951c9f'; do
+        for entry in 'baseline:5d5591ed91b810faf74b5bca543f52a7b950456c' 'final:54919c760bb6d2fb1492378abfd1764c88951c9f'; do
           role="${entry%%:*}"
           sha="${entry#*:}"
           case_root="$RUNNER_TEMP/q15595-r2-controls-$role"
@@ -102,7 +102,7 @@ jobs:
           set -e
           echo "install-build=$build_result" >> "$case_evidence/exits.txt"
           if [ "$build_result" -eq 0 ]; then
-            for item in 'core:packages/core:src/code-mode/scheduler.test.ts' 'web-shell:packages/web-shell:client/vite-config.test.ts' 'mem0:integrations/external-context-mem0:src/delete.integration.test.ts'; do
+            for item in 'memory:packages/core:src/memory/manager.test.ts'; do
               label="${item%%:*}"
               rest="${item#*:}"
               package="${rest%%:*}"
@@ -126,6 +126,6 @@ jobs:
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       if: ${{ always() }}
       with:
-        name: q15595-r2-failures-same-runner-${{ github.run_id }}
+        name: q15595-final-memory-same-runner-${{ github.run_id }}
         path: ci-evidence
         retention-days: 14
