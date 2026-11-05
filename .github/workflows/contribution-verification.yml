@@ -1,4 +1,4 @@
-name: 15595 R2 complete verification and ZIP comparison
+name: 15595 ZIP exact sources on one runner
 'on':
   push:
     branches:
@@ -6,157 +6,10 @@ name: 15595 R2 complete verification and ZIP comparison
 permissions:
   contents: read
 concurrency:
-  group: q15595-nov5-${{ github.workflow }}-${{ github.run_id }}
+  group: q15595-zip-same-runner-${{ github.run_id }}
   cancel-in-progress: false
 jobs:
-  complete:
-    if: github.repository == 'LyleLiu666/qwen-code'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    defaults:
-      run:
-        shell: bash
-    env:
-      CI: 'true'
-      NODE_OPTIONS: --max-old-space-size=6144
-      QWEN_CODE_MODELS_DEV_REFRESH: 'off'
-      VITEST_MIN_FORKS: '1'
-      VITEST_MAX_FORKS: '3'
-      VITEST_MIN_THREADS: '1'
-      VITEST_MAX_THREADS: '3'
-      QWEN_CI_COVERAGE: ''
-      LINT_BASE_SHA: ''
-      OPENAI_API_KEY: ''
-      DASHSCOPE_API_KEY: ''
-      QWEN_API_KEY: ''
-      GEMINI_API_KEY: ''
-      CANDIDATE_SHA: b6403235240f1fd1a7ae9b5324c836686fbc0a21
-    steps:
-    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
-      with:
-        ref: ${{ env.CANDIDATE_SHA }}
-        persist-credentials: false
-    - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
-      with:
-        node-version: 22.22.3
-        package-manager-cache: false
-    - name: Record exact revision
-      env:
-        EXPECTED_SHA: ${{ env.CANDIDATE_SHA }}
-      run: 'mkdir -p ci-evidence
-
-        [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
-
-        test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-
-        git show -s --format="%H %s" | tee ci-evidence/revision.txt
-
-        node --version | tee ci-evidence/node-version.txt
-
-        df -h | tee ci-evidence/disk-before.txt
-
-        printf "%s\n" "$(nproc)" | tee ci-evidence/cpus.txt
-
-        printf "%s\n" "$GITHUB_SHA" | tee ci-evidence/workflow-sha.txt
-
-        '
-    - name: Install locked dependencies
-      run: "set +e\n(\n  set -e\n  corepack pnpm install --frozen-lockfile\n) 2>&1 | tee \"ci-evidence/install-locked-dependencies.log\"\
-        \nresult=${PIPESTATUS[0]}\necho \"install-locked-dependencies=$result\" >> ci-evidence/exits.txt\nexit \"$result\"\
-        \n"
-      id: install
-      env:
-        QWEN_SKIP_PREPARE: '1'
-    - name: Build and bundle
-      run: "set +e\n(\n  set -e\n  npm run build\n  npm run bundle\n) 2>&1 | tee \"ci-evidence/build-and-bundle.log\"\nresult=${PIPESTATUS[0]}\n\
-        echo \"build-and-bundle=$result\" >> ci-evidence/exits.txt\nexit \"$result\"\n"
-      if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-      id: build
-    - name: Typecheck
-      run: "set +e\n(\n  set -e\n  npm run typecheck\n) 2>&1 | tee \"ci-evidence/typecheck.log\"\nresult=${PIPESTATUS[0]}\n\
-        echo \"typecheck=$result\" >> ci-evidence/exits.txt\nexit \"$result\"\n"
-      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-    - name: Install test and lint prerequisites
-      run: "set +e\n(\n  set -e\n  sudo -n apt-get update -qq\n  sudo -n apt-get install -y -qq tmux zip unzip python3-venv\n\
-        \  node --input-type=module -e '\n  import {execSync} from \"node:child_process\";\n  import {appendFileSync,mkdirSync,existsSync}\
-        \ from \"node:fs\";\n  import {getLinters,getLinterTempDir} from \"./scripts/lint.js\";\n  const dir=getLinterTempDir();\
-        \ mkdirSync(dir,{recursive:true});\n  for (const name of [\"actionlint\",\"shellcheck\"]) {\n   execSync(getLinters()[name].installer,{stdio:\"\
-        inherit\"});\n   if(!existsSync(dir+\"/\"+name+\"/\"+name)) throw new Error(name+\" missing\");\n   appendFileSync(process.env.GITHUB_PATH,dir+\"\
-        /\"+name+\"\\n\");\n  }'\n  python3 -m venv \"$RUNNER_TEMP/q15595-lint-python\"\n  \"$RUNNER_TEMP/q15595-lint-python/bin/pip\"\
-        \ install yamllint==1.35.1\n  echo \"$RUNNER_TEMP/q15595-lint-python/bin\" >> \"$GITHUB_PATH\"\n) 2>&1 | tee \"ci-evidence/install-test-and-lint-prerequisites.log\"\
-        \nresult=${PIPESTATUS[0]}\necho \"install-test-and-lint-prerequisites=$result\" >> ci-evidence/exits.txt\nexit \"\
-        $result\"\n"
-      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-      timeout-minutes: 10
-    - name: Lint eslint
-      run: "set +e\n(\n  set -e\n  node scripts/lint.js --eslint\n) 2>&1 | tee \"ci-evidence/lint-eslint.log\"\nresult=${PIPESTATUS[0]}\n\
-        echo \"lint-eslint=$result\" >> ci-evidence/exits.txt\nexit \"$result\"\n"
-      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-    - name: Lint actionlint
-      run: "set +e\n(\n  set -e\n  node scripts/lint.js --actionlint\n) 2>&1 | tee \"ci-evidence/lint-actionlint.log\"\nresult=${PIPESTATUS[0]}\n\
-        echo \"lint-actionlint=$result\" >> ci-evidence/exits.txt\nexit \"$result\"\n"
-      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-    - name: Lint shellcheck
-      run: "set +e\n(\n  set -e\n  node scripts/lint.js --shellcheck\n) 2>&1 | tee \"ci-evidence/lint-shellcheck.log\"\nresult=${PIPESTATUS[0]}\n\
-        echo \"lint-shellcheck=$result\" >> ci-evidence/exits.txt\nexit \"$result\"\n"
-      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-    - name: Lint yamllint
-      run: "set +e\n(\n  set -e\n  node scripts/lint.js --yamllint\n) 2>&1 | tee \"ci-evidence/lint-yamllint.log\"\nresult=${PIPESTATUS[0]}\n\
-        echo \"lint-yamllint=$result\" >> ci-evidence/exits.txt\nexit \"$result\"\n"
-      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-    - name: Lint prettier
-      run: "set +e\n(\n  set -e\n  node scripts/lint.js --prettier\n) 2>&1 | tee \"ci-evidence/lint-prettier.log\"\nresult=${PIPESTATUS[0]}\n\
-        echo \"lint-prettier=$result\" >> ci-evidence/exits.txt\nexit \"$result\"\n"
-      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-    - name: Lint sensitive-keywords
-      run: "set +e\n(\n  set -e\n  node scripts/lint.js --sensitive-keywords\n) 2>&1 | tee \"ci-evidence/lint-sensitive-keywords.log\"\
-        \nresult=${PIPESTATUS[0]}\necho \"lint-sensitive-keywords=$result\" >> ci-evidence/exits.txt\nexit \"$result\"\n"
-      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-    - name: Real loopback integration three files
-      run: "set +e\n(\n  set -e\n  cd integration-tests\n  ../node_modules/.bin/vitest run --config ./vitest.config.ts --maxWorkers=1\
-        \ --minWorkers=1 --retry=0 cli/tool-hook-context.test.ts cli/acp-agent-loop-parity.test.ts interactive/ink-agent-loop-parity.test.ts\n\
-        ) 2>&1 | tee \"ci-evidence/real-loopback-integration-three-files.log\"\nresult=${PIPESTATUS[0]}\necho \"real-loopback-integration-three-files=$result\"\
-        \ >> ci-evidence/exits.txt\nexit \"$result\"\n"
-      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-      env:
-        QWEN_SANDBOX: 'false'
-      timeout-minutes: 30
-    - name: Official complete unit lanes
-      run: "set +e\n(\n  set -e\n  unset QWEN_CI_SKIP_STANDALONE_RUNTIMES\n  bash .github/scripts/ci/run-unit-test-lanes.sh\
-        \ --retry=0\n) 2>&1 | tee \"ci-evidence/official-complete-unit-lanes.log\"\nresult=${PIPESTATUS[0]}\necho \"official-complete-unit-lanes=$result\"\
-        \ >> ci-evidence/exits.txt\nexit \"$result\"\n"
-      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-      env:
-        SIDE_LANE_LOG: ${{ github.workspace }}/ci-evidence/side-lane.log
-      timeout-minutes: 150
-    - name: Official node helper tests
-      run: "set +e\n(\n  set -e\n  node --test --test-concurrency=1 .github/scripts/pr-safety-precheck.test.mjs .github/scripts/cap-release-notes.test.mjs\
-        \ .github/scripts/ci/classify-profile.test.mjs .github/scripts/ci/classify-platform-sensitivity.test.mjs .github/scripts/ci/classify-pr-profile.test.mjs\
-        \ .github/scripts/upsert-bot-comment.test.mjs .github/scripts/ci/main-failure-signature.test.mjs .github/scripts/classify-release-notes.test.mjs\
-        \ .github/scripts/dsw-swe-verified/make-manifest.test.mjs .github/scripts/dsw-swe-verified/make-terminal-bench-manifest.test.mjs\
-        \ .github/scripts/resolve-sandbox-image.test.mjs .github/scripts/update-ecs-runner-qwen-workflow.test.mjs .github/scripts/web-shell-visuals-publish.test.mjs\
-        \ .github/scripts/web-shell-visuals-compose.test.mjs .github/scripts/serve-ab-diff.test.mjs .github/scripts/serve-ab-drive.test.mjs\
-        \ .github/scripts/qwen-triage-workflow.test.mjs .github/scripts/assign-issue-owner.test.mjs .github/scripts/auto-minimize-spam.test.mjs\
-        \ .github/scripts/ci-runner-routing.test.mjs .github/scripts/autofix-status-heartbeat.test.mjs .github/scripts/assign-pr-owner.test.mjs\
-        \ .github/scripts/check-disk-floor.test.mjs .github/scripts/check-lint-gate-freshness.test.mjs .github/scripts/ci-disk-pressure.test.mjs\
-        \ .github/scripts/e2e-build.test.mjs integration-tests/concurrent-runner/export-html-from-chatrecord-jsonl.test.mjs\
-        \ .github/scripts/review-runner-schedule.test.mjs .github/scripts/ecs-runner/qwen-docker-cleanup.test.mjs .github/scripts/ecs-runner/review-scratch-cleanup.test.mjs\
-        \ .github/scripts/check-test-growth.test.mjs .github/scripts/check-ci-budget.test.mjs .github/scripts/ecs-runner/check-font-baseline.test.mjs\n\
-        ) 2>&1 | tee \"ci-evidence/official-node-helper-tests.log\"\nresult=${PIPESTATUS[0]}\necho \"official-node-helper-tests=$result\"\
-        \ >> ci-evidence/exits.txt\nexit \"$result\"\n"
-      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-    - name: Serve fast-path bundle closure
-      run: "set +e\n(\n  set -e\n  npm run check:serve-fast-path-bundle\n) 2>&1 | tee \"ci-evidence/serve-fast-path-bundle-closure.log\"\
-        \nresult=${PIPESTATUS[0]}\necho \"serve-fast-path-bundle-closure=$result\" >> ci-evidence/exits.txt\nexit \"$result\"\
-        \n"
-      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-      if: ${{ always() }}
-      with:
-        name: q15595-review2-full-${{ github.run_id }}
-        path: ci-evidence
-        retention-days: 14
-  zip_compare:
+  zip_same_runner:
     if: github.repository == 'LyleLiu666/qwen-code'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -180,7 +33,8 @@ jobs:
     steps:
     - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
       with:
-        ref: ${{ matrix.sha }}
+        ref: b6403235240f1fd1a7ae9b5324c836686fbc0a21
+        fetch-depth: 0
         persist-credentials: false
     - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
       with:
@@ -188,7 +42,7 @@ jobs:
         package-manager-cache: false
     - name: Record exact revision
       env:
-        EXPECTED_SHA: ${{ matrix.sha }}
+        EXPECTED_SHA: b6403235240f1fd1a7ae9b5324c836686fbc0a21
       run: 'mkdir -p ci-evidence
 
         [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -206,18 +60,6 @@ jobs:
         printf "%s\n" "$GITHUB_SHA" | tee ci-evidence/workflow-sha.txt
 
         '
-    - name: Install locked dependencies
-      run: "set +e\n(\n  set -e\n  corepack pnpm install --frozen-lockfile\n) 2>&1 | tee \"ci-evidence/install-locked-dependencies.log\"\
-        \nresult=${PIPESTATUS[0]}\necho \"install-locked-dependencies=$result\" >> ci-evidence/exits.txt\nexit \"$result\"\
-        \n"
-      id: install
-      env:
-        QWEN_SKIP_PREPARE: '1'
-    - name: Build and bundle
-      run: "set +e\n(\n  set -e\n  npm run build\n  npm run bundle\n) 2>&1 | tee \"ci-evidence/build-and-bundle.log\"\nresult=${PIPESTATUS[0]}\n\
-        echo \"build-and-bundle=$result\" >> ci-evidence/exits.txt\nexit \"$result\"\n"
-      if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-      id: build
     - name: Install matched prerequisites
       run: "set +e\n(\n  set -e\n  sudo -n apt-get update -qq\n  sudo -n apt-get install -y -qq tmux zip unzip python3-venv\n\
         \  node --input-type=module -e '\n  import {execSync} from \"node:child_process\";\n  import {appendFileSync,mkdirSync,existsSync}\
@@ -228,35 +70,28 @@ jobs:
         \ install yamllint==1.35.1\n  echo \"$RUNNER_TEMP/q15595-lint-python/bin\" >> \"$GITHUB_PATH\"\n) 2>&1 | tee \"ci-evidence/install-matched-prerequisites.log\"\
         \nresult=${PIPESTATUS[0]}\necho \"install-matched-prerequisites=$result\" >> ci-evidence/exits.txt\nexit \"$result\"\
         \n"
-      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
       timeout-minutes: 10
-    - name: Matched whole-file attempts
-      run: "set +e\n(\n  set -e\n  overall=0\n  [[ \"$PACKAGE_DIR\" != /* && \"$TEST_FILE\" != /* ]]\n  [[ \"$PACKAGE_DIR\"\
-        \ != *..* && \"$TEST_FILE\" != *..* ]]\n  test -f \"$PACKAGE_DIR/$TEST_FILE\"\n  for attempt in 1 2 3; do\n    set\
-        \ +e\n    (cd \"$PACKAGE_DIR\" && NODE_OPTIONS=--max-old-space-size=3072 npx --no-install vitest run --retry=0 \"\
-        $TEST_FILE\" --reporter=default --reporter=json --outputFile=\"../../ci-evidence/attempt-$attempt.json\") 2>&1 | tee\
-        \ \"ci-evidence/attempt-$attempt.log\"\n    result=${PIPESTATUS[0]}\n    echo \"attempt-$attempt=$result\" >> ci-evidence/exits.txt\n\
-        \    if [ \"$result\" -ne 0 ]; then overall=1; fi\n    set -e\n  done\n  exit \"$overall\"\n) 2>&1 | tee \"ci-evidence/matched-whole-file-attempts.log\"\
-        \nresult=${PIPESTATUS[0]}\necho \"matched-whole-file-attempts=$result\" >> ci-evidence/exits.txt\nexit \"$result\"\
-        \n"
-      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-      env:
-        PACKAGE_DIR: packages/cli
-        TEST_FILE: src/serve/workspace-skill-management.test.ts
+    - name: Three exact revisions on the same runner
+      run: "set -euo pipefail\nroot=\"$PWD\"\nevidence=\"$root/ci-evidence\"\noverall=0\nprintf '%s\\n' \"${ImageOS:-}\" \"\
+        ${ImageVersion:-}\" > \"$evidence/runner-image.txt\"\nfor entry in 'baseline:5d5591ed91b810faf74b5bca543f52a7b950456c'\
+        \ 'intermediate:9cb12fa6ab4ebf16c9deab7ddf1aa69cc3817041' 'final:b6403235240f1fd1a7ae9b5324c836686fbc0a21'; do\n \
+        \ role=\"${entry%%:*}\"\n  sha=\"${entry#*:}\"\n  case_root=\"$RUNNER_TEMP/q15595-zip-$role\"\n  case_evidence=\"\
+        $evidence/$role\"\n  mkdir -p \"$case_evidence\"\n  git cat-file -e \"$sha^{commit}\"\n  git worktree add --detach\
+        \ \"$case_root\" \"$sha\"\n  git -C \"$case_root\" rev-parse HEAD > \"$case_evidence/revision.txt\"\n  node --version\
+        \ > \"$case_evidence/node-version.txt\"\n  nproc > \"$case_evidence/cpus.txt\"\n  df -h > \"$case_evidence/disk-before.txt\"\
+        \n  set +e\n  (cd \"$case_root\" && QWEN_SKIP_PREPARE=1 corepack pnpm install --frozen-lockfile && npm run build &&\
+        \ npm run bundle) 2>&1 | tee \"$case_evidence/install-build.log\"\n  build_result=${PIPESTATUS[0]}\n  set -e\n  echo\
+        \ \"install-build=$build_result\" >> \"$case_evidence/exits.txt\"\n  if [ \"$build_result\" -eq 0 ]; then\n    for\
+        \ attempt in 1 2 3; do\n      set +e\n      (cd \"$case_root/packages/cli\" && NODE_OPTIONS=--max-old-space-size=3072\
+        \ npx --no-install vitest run --retry=0 src/serve/workspace-skill-management.test.ts --reporter=default --reporter=json\
+        \ --outputFile=\"$case_evidence/attempt-$attempt.json\") 2>&1 | tee \"$case_evidence/attempt-$attempt.log\"\n    \
+        \  result=${PIPESTATUS[0]}\n      set -e\n      echo \"attempt-$attempt=$result\" >> \"$case_evidence/exits.txt\"\n\
+        \      if [ \"$result\" -ne 0 ]; then overall=1; fi\n    done\n  else\n    overall=1\n  fi\n  # Only the ephemeral\
+        \ source tree is removed; evidence stays outside it.\n  git worktree remove --force \"$case_root\"\ndone\nexit \"\
+        $overall\"\n"
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       if: ${{ always() }}
       with:
-        name: q15595-review2-zip-${{ matrix.role }}-${{ github.run_id }}
+        name: q15595-review2-zip-same-runner-${{ github.run_id }}
         path: ci-evidence
         retention-days: 14
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-        - role: intermediate
-          sha: 9cb12fa6ab4ebf16c9deab7ddf1aa69cc3817041
-        - role: baseline
-          sha: 5d5591ed91b810faf74b5bca543f52a7b950456c
-        - role: final
-          sha: b6403235240f1fd1a7ae9b5324c836686fbc0a21
-    name: ${{ matrix.role }} ZIP staging comparison
