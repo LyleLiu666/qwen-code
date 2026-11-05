@@ -25654,8 +25654,7 @@ describe('useLlmStream', () => {
     expect(event.turnCount).toBe(3);
   });
 
-  it('keeps the legacy non-Goal quota-switch history policy when the shared loop is disabled', async () => {
-    mockConfig.isUnifiedAgentLoopEnabled = vi.fn(() => false);
+  it('does not record admission when a non-Goal scheduler quota switch stops the turn', async () => {
     const recordToolResultAdmission = vi.fn();
     mockConfig.getChatRecordingService = vi.fn(() => ({
       recordToolResultAdmission,
