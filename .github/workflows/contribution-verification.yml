@@ -1,4 +1,4 @@
-name: 15595 final MemoryManager exact source controls
+name: 15595 main7c complete verification
 'on':
   push:
     branches:
@@ -6,10 +6,10 @@ name: 15595 final MemoryManager exact source controls
 permissions:
   contents: read
 concurrency:
-  group: q15595-memory-controls-${{ github.run_id }}
+  group: q15595-main7c-${{ github.run_id }}
   cancel-in-progress: false
 jobs:
-  matched_failures:
+  complete:
     if: github.repository == 'LyleLiu666/qwen-code'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -30,11 +30,11 @@ jobs:
       DASHSCOPE_API_KEY: ''
       QWEN_API_KEY: ''
       GEMINI_API_KEY: ''
+      CANDIDATE_SHA: 54919c760bb6d2fb1492378abfd1764c88951c9f
     steps:
     - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
       with:
-        ref: 54919c760bb6d2fb1492378abfd1764c88951c9f
-        fetch-depth: 0
+        ref: ${{ env.CANDIDATE_SHA }}
         persist-credentials: false
     - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
       with:
@@ -42,7 +42,7 @@ jobs:
         package-manager-cache: false
     - name: Record exact revision
       env:
-        EXPECTED_SHA: 54919c760bb6d2fb1492378abfd1764c88951c9f
+        EXPECTED_SHA: ${{ env.CANDIDATE_SHA }}
       run: |
         mkdir -p ci-evidence
         [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -52,7 +52,44 @@ jobs:
         df -h | tee ci-evidence/disk-before.txt
         printf "%s\n" "$(nproc)" | tee ci-evidence/cpus.txt
         printf "%s\n" "$GITHUB_SHA" | tee ci-evidence/workflow-sha.txt
-    - name: Install matched prerequisites
+    - name: Install locked dependencies
+      run: |
+        set +e
+        (
+          set -e
+          corepack pnpm install --frozen-lockfile
+        ) 2>&1 | tee "ci-evidence/install-locked-dependencies.log"
+        result=${PIPESTATUS[0]}
+        echo "install-locked-dependencies=$result" >> ci-evidence/exits.txt
+        exit "$result"
+      id: install
+      env:
+        QWEN_SKIP_PREPARE: '1'
+    - name: Build and bundle
+      run: |
+        set +e
+        (
+          set -e
+          npm run build
+          npm run bundle
+        ) 2>&1 | tee "ci-evidence/build-and-bundle.log"
+        result=${PIPESTATUS[0]}
+        echo "build-and-bundle=$result" >> ci-evidence/exits.txt
+        exit "$result"
+      if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+      id: build
+    - name: Typecheck
+      run: |
+        set +e
+        (
+          set -e
+          npm run typecheck
+        ) 2>&1 | tee "ci-evidence/typecheck.log"
+        result=${PIPESTATUS[0]}
+        echo "typecheck=$result" >> ci-evidence/exits.txt
+        exit "$result"
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+    - name: Install test and lint prerequisites
       run: |
         set +e
         (
@@ -72,60 +109,130 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/q15595-lint-python"
           "$RUNNER_TEMP/q15595-lint-python/bin/pip" install yamllint==1.35.1
           echo "$RUNNER_TEMP/q15595-lint-python/bin" >> "$GITHUB_PATH"
-        ) 2>&1 | tee "ci-evidence/install-matched-prerequisites.log"
+        ) 2>&1 | tee "ci-evidence/install-test-and-lint-prerequisites.log"
         result=${PIPESTATUS[0]}
-        echo "install-matched-prerequisites=$result" >> ci-evidence/exits.txt
+        echo "install-test-and-lint-prerequisites=$result" >> ci-evidence/exits.txt
         exit "$result"
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
       timeout-minutes: 10
-    - name: Two exact revisions and complete MemoryManager file
+    - name: Lint eslint
       run: |
-        set -euo pipefail
-        root="$PWD"
-        evidence="$root/ci-evidence"
-        overall=0
-        printf '%s\n' "${ImageOS:-}" "${ImageVersion:-}" > "$evidence/runner-image.txt"
-        for entry in 'baseline:5d5591ed91b810faf74b5bca543f52a7b950456c' 'final:54919c760bb6d2fb1492378abfd1764c88951c9f'; do
-          role="${entry%%:*}"
-          sha="${entry#*:}"
-          case_root="$RUNNER_TEMP/q15595-r2-controls-$role"
-          case_evidence="$evidence/$role"
-          mkdir -p "$case_evidence"
-          git cat-file -e "$sha^{commit}"
-          git worktree add --detach "$case_root" "$sha"
-          git -C "$case_root" rev-parse HEAD > "$case_evidence/revision.txt"
-          node --version > "$case_evidence/node-version.txt"
-          nproc > "$case_evidence/cpus.txt"
-          df -h > "$case_evidence/disk-before.txt"
-          set +e
-          (cd "$case_root" && QWEN_SKIP_PREPARE=1 corepack pnpm install --frozen-lockfile && npm run build && npm run bundle) 2>&1 | tee "$case_evidence/install-build.log"
-          build_result=${PIPESTATUS[0]}
+        set +e
+        (
           set -e
-          echo "install-build=$build_result" >> "$case_evidence/exits.txt"
-          if [ "$build_result" -eq 0 ]; then
-            for item in 'memory:packages/core:src/memory/manager.test.ts'; do
-              label="${item%%:*}"
-              rest="${item#*:}"
-              package="${rest%%:*}"
-              file="${rest#*:}"
-              test -f "$case_root/$package/$file"
-              for attempt in 1 2 3; do
-                set +e
-                (cd "$case_root/$package" && NODE_OPTIONS=--max-old-space-size=3072 npx --no-install vitest run --retry=0 "$file" --reporter=default --reporter=json --outputFile="$case_evidence/$label-$attempt.json") 2>&1 | tee "$case_evidence/$label-$attempt.log"
-                result=${PIPESTATUS[0]}
-                set -e
-                echo "$label-$attempt=$result" >> "$case_evidence/exits.txt"
-                if [ "$result" -ne 0 ]; then overall=1; fi
-              done
-            done
-          else
-            overall=1
-          fi
-          git worktree remove --force "$case_root"
-        done
-        exit "$overall"
+          node scripts/lint.js --eslint
+        ) 2>&1 | tee "ci-evidence/lint-eslint.log"
+        result=${PIPESTATUS[0]}
+        echo "lint-eslint=$result" >> ci-evidence/exits.txt
+        exit "$result"
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+    - name: Lint actionlint
+      run: |
+        set +e
+        (
+          set -e
+          node scripts/lint.js --actionlint
+        ) 2>&1 | tee "ci-evidence/lint-actionlint.log"
+        result=${PIPESTATUS[0]}
+        echo "lint-actionlint=$result" >> ci-evidence/exits.txt
+        exit "$result"
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+    - name: Lint shellcheck
+      run: |
+        set +e
+        (
+          set -e
+          node scripts/lint.js --shellcheck
+        ) 2>&1 | tee "ci-evidence/lint-shellcheck.log"
+        result=${PIPESTATUS[0]}
+        echo "lint-shellcheck=$result" >> ci-evidence/exits.txt
+        exit "$result"
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+    - name: Lint yamllint
+      run: |
+        set +e
+        (
+          set -e
+          node scripts/lint.js --yamllint
+        ) 2>&1 | tee "ci-evidence/lint-yamllint.log"
+        result=${PIPESTATUS[0]}
+        echo "lint-yamllint=$result" >> ci-evidence/exits.txt
+        exit "$result"
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+    - name: Lint prettier
+      run: |
+        set +e
+        (
+          set -e
+          node scripts/lint.js --prettier
+        ) 2>&1 | tee "ci-evidence/lint-prettier.log"
+        result=${PIPESTATUS[0]}
+        echo "lint-prettier=$result" >> ci-evidence/exits.txt
+        exit "$result"
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+    - name: Lint sensitive-keywords
+      run: |
+        set +e
+        (
+          set -e
+          node scripts/lint.js --sensitive-keywords
+        ) 2>&1 | tee "ci-evidence/lint-sensitive-keywords.log"
+        result=${PIPESTATUS[0]}
+        echo "lint-sensitive-keywords=$result" >> ci-evidence/exits.txt
+        exit "$result"
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+    - name: Real loopback integration four files
+      run: |
+        set +e
+        (
+          set -e
+          cd integration-tests
+          ../node_modules/.bin/vitest run --config ./vitest.config.ts --maxWorkers=1 --minWorkers=1 --retry=0 cli/tool-hook-context.test.ts cli/acp-agent-loop-parity.test.ts interactive/ink-agent-loop-parity.test.ts interactive/mods-prompt-submit.test.ts
+        ) 2>&1 | tee "ci-evidence/real-loopback-integration-three-files.log"
+        result=${PIPESTATUS[0]}
+        echo "real-loopback-integration-three-files=$result" >> ci-evidence/exits.txt
+        exit "$result"
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+      env:
+        QWEN_SANDBOX: 'false'
+      timeout-minutes: 30
+    - name: Official complete unit lanes
+      run: |
+        set +e
+        (
+          set -e
+          unset QWEN_CI_SKIP_STANDALONE_RUNTIMES
+          bash .github/scripts/ci/run-unit-test-lanes.sh --retry=0
+        ) 2>&1 | tee "ci-evidence/official-complete-unit-lanes.log"
+        result=${PIPESTATUS[0]}
+        echo "official-complete-unit-lanes=$result" >> ci-evidence/exits.txt
+        exit "$result"
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+      env:
+        SIDE_LANE_LOG: ${{ github.workspace }}/ci-evidence/side-lane.log
+      timeout-minutes: 150
+    - name: Official node helper tests
+      run: |
+        set +e
+        (node --test --test-concurrency=1 .github/scripts/pr-safety-precheck.test.mjs .github/scripts/cap-release-notes.test.mjs .github/scripts/ci/classify-profile.test.mjs .github/scripts/ci/classify-platform-sensitivity.test.mjs .github/scripts/ci/classify-pr-profile.test.mjs .github/scripts/upsert-bot-comment.test.mjs .github/scripts/ci/main-failure-signature.test.mjs .github/scripts/classify-release-notes.test.mjs .github/scripts/dsw-swe-verified/make-manifest.test.mjs .github/scripts/dsw-swe-verified/make-terminal-bench-manifest.test.mjs .github/scripts/resolve-sandbox-image.test.mjs .github/scripts/update-ecs-runner-qwen-workflow.test.mjs .github/scripts/web-shell-visuals-publish.test.mjs .github/scripts/web-shell-visuals-compose.test.mjs .github/scripts/serve-ab-diff.test.mjs .github/scripts/serve-ab-drive.test.mjs .github/scripts/qwen-triage-workflow.test.mjs .github/scripts/assign-issue-owner.test.mjs .github/scripts/auto-minimize-spam.test.mjs .github/scripts/ci-runner-routing.test.mjs .github/scripts/autofix-status-heartbeat.test.mjs .github/scripts/assign-pr-owner.test.mjs .github/scripts/check-disk-floor.test.mjs .github/scripts/check-lint-gate-freshness.test.mjs .github/scripts/ci-disk-pressure.test.mjs .github/scripts/e2e-build.test.mjs integration-tests/concurrent-runner/export-html-from-chatrecord-jsonl.test.mjs .github/scripts/review-runner-schedule.test.mjs .github/scripts/ecs-runner/qwen-docker-cleanup.test.mjs .github/scripts/ecs-runner/review-scratch-cleanup.test.mjs .github/scripts/check-test-growth.test.mjs .github/scripts/check-ci-budget.test.mjs .github/scripts/ecs-runner/check-font-baseline.test.mjs) 2>&1 | tee ci-evidence/official-node-helper-tests.log
+        result=${PIPESTATUS[0]}
+        echo "official-node-helper-tests=$result" >> ci-evidence/exits.txt
+        exit "$result"
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+    - name: Serve fast-path bundle closure
+      run: |
+        set +e
+        (
+          set -e
+          npm run check:serve-fast-path-bundle
+        ) 2>&1 | tee "ci-evidence/serve-fast-path-bundle-closure.log"
+        result=${PIPESTATUS[0]}
+        echo "serve-fast-path-bundle-closure=$result" >> ci-evidence/exits.txt
+        exit "$result"
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       if: ${{ always() }}
       with:
-        name: q15595-final-memory-same-runner-${{ github.run_id }}
+        name: q15595-main7c-full-${{ github.run_id }}
         path: ci-evidence
         retention-days: 14
