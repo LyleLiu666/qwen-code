@@ -1,4 +1,4 @@
-name: 15595 R6 CLI coverage and matched failure controls
+name: 15595 R6 matched Escape failure control
 on:
   push:
     branches:
@@ -6,122 +6,9 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: q15595-r6-gate-supplement-${{ github.run_id }}
+  group: q15595-r6-gate-escape-${{ github.run_id }}
   cancel-in-progress: false
 jobs:
-  cli_complete:
-    if: github.repository == 'LyleLiu666/qwen-code'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    defaults:
-      run:
-        shell: bash
-    env:
-      CI: "true"
-      NODE_OPTIONS: --max-old-space-size=6144
-      QWEN_CODE_MODELS_DEV_REFRESH: off
-      VITEST_MIN_FORKS: "1"
-      VITEST_MAX_FORKS: "3"
-      VITEST_MIN_THREADS: "1"
-      VITEST_MAX_THREADS: "3"
-      QWEN_CI_COVERAGE: ""
-      LINT_BASE_SHA: ""
-      OPENAI_API_KEY: ""
-      DASHSCOPE_API_KEY: ""
-      QWEN_API_KEY: ""
-      GEMINI_API_KEY: ""
-      CANDIDATE_SHA: ac95c52a94baf6da82c85e611b64c353343a520c
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
-        with:
-          ref: ${{ env.CANDIDATE_SHA }}
-          persist-credentials: false
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
-        with:
-          node-version: 22.22.3
-          package-manager-cache: false
-      - name: Record exact revision
-        env:
-          EXPECTED_SHA: ${{ env.CANDIDATE_SHA }}
-        run: |
-          mkdir -p ci-evidence
-          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-          git show -s --format="%H %s" | tee ci-evidence/revision.txt
-          node --version | tee ci-evidence/node-version.txt
-          df -h | tee ci-evidence/disk-before.txt
-          printf "%s\n" "$(nproc)" | tee ci-evidence/cpus.txt
-          printf "%s\n" "$GITHUB_SHA" | tee ci-evidence/workflow-sha.txt
-      - name: Install locked dependencies
-        run: |
-          set +e
-          (
-            set -e
-            corepack pnpm install --frozen-lockfile
-          ) 2>&1 | tee "ci-evidence/install-locked-dependencies.log"
-          result=${PIPESTATUS[0]}
-          echo "install-locked-dependencies=$result" >> ci-evidence/exits.txt
-          exit "$result"
-        id: install
-        env:
-          QWEN_SKIP_PREPARE: "1"
-      - name: Build and bundle
-        run: |
-          set +e
-          (
-            set -e
-            npm run build
-            npm run bundle
-          ) 2>&1 | tee "ci-evidence/build-and-bundle.log"
-          result=${PIPESTATUS[0]}
-          echo "build-and-bundle=$result" >> ci-evidence/exits.txt
-          exit "$result"
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        id: build
-      - name: Install test and lint prerequisites
-        run: |
-          set +e
-          (
-            set -e
-            sudo -n apt-get update -qq
-            sudo -n apt-get install -y -qq tmux zip unzip python3-venv
-            node --input-type=module -e '
-            import {execSync} from "node:child_process";
-            import {appendFileSync,mkdirSync,existsSync} from "node:fs";
-            import {getLinters,getLinterTempDir} from "./scripts/lint.js";
-            const dir=getLinterTempDir(); mkdirSync(dir,{recursive:true});
-            for (const name of ["actionlint","shellcheck"]) {
-             execSync(getLinters()[name].installer,{stdio:"inherit"});
-             if(!existsSync(dir+"/"+name+"/"+name)) throw new Error(name+" missing");
-             appendFileSync(process.env.GITHUB_PATH,dir+"/"+name+"\n");
-            }'
-            python3 -m venv "$RUNNER_TEMP/q15595-lint-python"
-            "$RUNNER_TEMP/q15595-lint-python/bin/pip" install yamllint==1.35.1
-            echo "$RUNNER_TEMP/q15595-lint-python/bin" >> "$GITHUB_PATH"
-          ) 2>&1 | tee "ci-evidence/install-test-and-lint-prerequisites.log"
-          result=${PIPESTATUS[0]}
-          echo "install-test-and-lint-prerequisites=$result" >> ci-evidence/exits.txt
-          exit "$result"
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        timeout-minutes: 10
-      - name: Complete CLI scope without bail
-        working-directory: packages/cli
-        timeout-minutes: 150
-        env:
-          NODE_OPTIONS: --max-old-space-size=3072
-        run: |
-          set +e
-          npx --no-install vitest run --bail=0 --retry=0 2>&1 | tee ../../ci-evidence/cli-complete.log
-          result=${PIPESTATUS[0]}
-          echo "cli-complete=$result" >> ../../ci-evidence/exits.txt
-          exit "$result"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: ${{ always() }}
-        with:
-          name: q15595-r6-gate-cli-complete-${{ github.run_id }}
-          path: ci-evidence
-          retention-days: 14
-    name: ac95c52a9 complete CLI with bail disabled
   matched_failures:
     if: github.repository == 'LyleLiu666/qwen-code'
     runs-on: ubuntu-24.04
@@ -192,7 +79,7 @@ jobs:
           echo "install-matched-prerequisites=$result" >> ci-evidence/exits.txt
           exit "$result"
         timeout-minutes: 10
-      - name: Two exact revisions and two complete failure files
+      - name: Two exact revisions and one complete failure file
         run: |
           set -euo pipefail
           root="$PWD"
@@ -217,7 +104,7 @@ jobs:
             set -e
             echo "install-build=$build_result" >> "$case_evidence/exits.txt"
             if [ "$build_result" -eq 0 ]; then
-              for item in 'pr-refresh:packages/cli:src/serve/server/session-pr-refresh.test.ts' 'scheduler:packages/core:src/code-mode/scheduler.test.ts'; do
+              for item in 'escape:packages/cli:src/ui/components/background-view/BackgroundTasksDialog.test.tsx'; do
                 label="${item%%:*}"
                 rest="${item#*:}"
                 package="${rest%%:*}"
@@ -243,7 +130,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: ${{ always() }}
         with:
-          name: q15595-r6-gate-same-runner-${{ github.run_id }}
+          name: q15595-r6-gate-escape-${{ github.run_id }}
           path: ci-evidence
           retention-days: 14
     name: Exact 1888aaf4 and ac95c52a9 matched failure-file controls
